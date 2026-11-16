@@ -2,18 +2,9 @@ import { flatten } from 'lodash'
 import { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { Runnable, RunnableConfig } from '@langchain/core/runnables'
 import { ChatPromptTemplate, MessagesPlaceholder, HumanMessagePromptTemplate } from '@langchain/core/prompts'
-import {
-    ICommonObject,
-    IMultiAgentNode,
-    INode,
-    INodeData,
-    INodeParams,
-    ITeamState,
-    IVisionChatModal,
-    MessageContentImageUrl
-} from '../../../src/Interface'
+import { ICommonObject, IMultiAgentNode, INode, INodeData, INodeParams, ITeamState, MessageContentImageUrl } from '../../../src/Interface'
 import { Moderation } from '../../moderation/Moderation'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { StructuredTool } from '@langchain/core/tools'
 import { AgentExecutor, JsonOutputToolsParser, ToolCallingAgentOutputParser } from '../../../src/agents'
 import { ChatMistralAI } from '@langchain/mistralai'
@@ -21,6 +12,7 @@ import { ChatOpenAI } from '../../chatmodels/ChatOpenAI/FlowiseChatOpenAI'
 import { ChatAnthropic } from '../../chatmodels/ChatAnthropic/FlowiseChatAnthropic'
 import { addImagesToMessages, llmSupportsVision } from '../../../src/multiModalUtils'
 import { ChatGoogleGenerativeAI } from '../../chatmodels/ChatGoogleGenerativeAI/FlowiseChatGoogleGenerativeAI'
+import { AzureChatOpenAI } from '../../chatmodels/AzureChatOpenAI/FlowiseAzureChatOpenAI'
 
 const sysPrompt = `You are a supervisor tasked with managing a conversation between the following workers: {team_members}.
 Given the following user request, respond with the worker to act next.
@@ -163,9 +155,7 @@ class Supervisor_MultiAgents implements INode {
                 multiModalMessageContent = messages.multiModalMessageContent
 
                 // Force Mistral to use tool
-                // @ts-ignore
-                const modelWithTool = llm.bind({
-                    tools: [tool],
+                const modelWithTool = llm.bindTools([tool]).withConfig({
                     tool_choice: 'any',
                     signal: abortControllerSignal ? abortControllerSignal.signal : undefined
                 })
@@ -242,7 +232,7 @@ class Supervisor_MultiAgents implements INode {
                             }
                         }
                     })
-            } else if (llm instanceof ChatOpenAI) {
+            } else if (llm instanceof ChatOpenAI || llm instanceof AzureChatOpenAI) {
                 let prompt = ChatPromptTemplate.fromMessages([
                     ['system', systemPrompt],
                     new MessagesPlaceholder('messages'),
@@ -255,8 +245,7 @@ class Supervisor_MultiAgents implements INode {
                 multiModalMessageContent = messages.multiModalMessageContent
 
                 // Force OpenAI to use tool
-                const modelWithTool = llm.bind({
-                    tools: [tool],
+                const modelWithTool = llm.bindTools([tool]).withConfig({
                     tool_choice: { type: 'function', function: { name: routerToolName } },
                     signal: abortControllerSignal ? abortControllerSignal.signal : undefined
                 })
@@ -416,9 +405,7 @@ class Supervisor_MultiAgents implements INode {
                 multiModalMessageContent = messages.multiModalMessageContent
 
                 // Force Mistral to use tool
-                // @ts-ignore
-                const modelWithTool = llm.bind({
-                    tools: [tool],
+                const modelWithTool = llm.bindTools([tool]).withConfig({
                     tool_choice: 'any',
                     signal: abortControllerSignal ? abortControllerSignal.signal : undefined
                 })
@@ -513,8 +500,7 @@ class Supervisor_MultiAgents implements INode {
                 multiModalMessageContent = messages.multiModalMessageContent
 
                 // Force OpenAI to use tool
-                const modelWithTool = llm.bind({
-                    tools: [tool],
+                const modelWithTool = llm.bindTools([tool]).withConfig({
                     tool_choice: { type: 'function', function: { name: routerToolName } },
                     signal: abortControllerSignal ? abortControllerSignal.signal : undefined
                 })
@@ -714,17 +700,11 @@ const processImageMessage = async (
     let multiModalMessageContent: MessageContentImageUrl[] = []
 
     if (llmSupportsVision(llm)) {
-        const visionChatModel = llm as IVisionChatModal
         multiModalMessageContent = await addImagesToMessages(nodeData, options, llm.multiModalOption)
 
         if (multiModalMessageContent?.length) {
-            visionChatModel.setVisionModel()
-
             const msg = HumanMessagePromptTemplate.fromTemplate([...multiModalMessageContent])
-
             prompt.promptMessages.splice(index, 0, msg)
-        } else {
-            visionChatModel.revertToOriginalModel()
         }
     }
 

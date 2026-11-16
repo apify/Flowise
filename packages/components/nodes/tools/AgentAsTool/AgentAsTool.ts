@@ -1,10 +1,16 @@
 import { DataSource } from 'typeorm'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { RunnableConfig } from '@langchain/core/runnables'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
 import { StructuredTool } from '@langchain/core/tools'
 import { ICommonObject, IDatabaseEntity, INode, INodeData, INodeOptionsValue, INodeParams } from '../../../src/Interface'
-import { getCredentialData, getCredentialParam, executeJavaScriptCode, createCodeExecutionSandbox } from '../../../src/utils'
+import {
+    getCredentialData,
+    getCredentialParam,
+    executeJavaScriptCode,
+    createCodeExecutionSandbox,
+    parseWithTypeConversion
+} from '../../../src/utils'
 import { isValidUUID, isValidURL } from '../../../src/validator'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -273,7 +279,7 @@ class AgentflowTool extends StructuredTool {
         }
         let parsed
         try {
-            parsed = await this.schema.parseAsync(arg)
+            parsed = await parseWithTypeConversion(this.schema, arg)
         } catch (e) {
             throw new Error(`Received tool input did not match expected schema: ${JSON.stringify(arg)}`)
         }
@@ -339,7 +345,7 @@ class AgentflowTool extends StructuredTool {
 
         const code = `
 const fetch = require('node-fetch');
-const url = "${this.baseURL}/api/v1/prediction/${this.agentflowid}";
+const url = $apiURL;
 
 const body = $callBody;
 
@@ -358,14 +364,14 @@ try {
         // Create additional sandbox variables
         const additionalSandbox: ICommonObject = {
             $callOptions: options,
-            $callBody: body
+            $callBody: body,
+            $apiURL: `${this.baseURL}/api/v1/prediction/${this.agentflowid}`
         }
 
         const sandbox = createCodeExecutionSandbox('', [], {}, additionalSandbox)
 
         let response = await executeJavaScriptCode(code, sandbox, {
-            useSandbox: false,
-            timeout: 10000
+            useSandbox: false
         })
 
         if (typeof response === 'object') {

@@ -2,6 +2,7 @@ import { ChatOpenAI, ChatOpenAIFields } from '@langchain/openai'
 import { BaseCache } from '@langchain/core/caches'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
+import { checkDenyList } from '../../../src/httpSecurity'
 
 class ChatOpenAICustom_ChatModels implements INode {
     label: string
@@ -16,7 +17,7 @@ class ChatOpenAICustom_ChatModels implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'ChatOpenAI Custom'
+        this.label = 'OpenAI Custom Model'
         this.name = 'chatOpenAICustom'
         this.version = 4.0
         this.type = 'ChatOpenAI-Custom'
@@ -101,17 +102,19 @@ class ChatOpenAICustom_ChatModels implements INode {
                 additionalParams: true
             },
             {
-                label: 'BasePath',
+                label: 'Base Path',
                 name: 'basepath',
                 type: 'string',
                 optional: true,
+                description: 'Override the default base URL for the API, e.g., "https://api.example.com/v2/',
                 additionalParams: true
             },
             {
-                label: 'BaseOptions',
+                label: 'Base Options',
                 name: 'baseOptions',
                 type: 'json',
                 optional: true,
+                description: 'Default headers to include with every request to the API.',
                 additionalParams: true
             }
         ]
@@ -157,6 +160,8 @@ class ChatOpenAICustom_ChatModels implements INode {
                 throw new Error("Invalid JSON in the ChatOpenAI's BaseOptions: " + exception)
             }
         }
+
+        if (basePath) await checkDenyList(basePath)
 
         if (basePath || parsedBaseOptions) {
             obj.configuration = {

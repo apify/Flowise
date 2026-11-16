@@ -1,5 +1,5 @@
 import { get } from 'lodash'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { DataSource } from 'typeorm'
 import { StructuredTool } from '@langchain/core/tools'
 import { ChatMistralAI } from '@langchain/mistralai'
@@ -8,14 +8,7 @@ import { Runnable, RunnableConfig, mergeConfigs } from '@langchain/core/runnable
 import { AIMessage, BaseMessage, HumanMessage, MessageContentImageUrl, ToolMessage } from '@langchain/core/messages'
 import { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { addImagesToMessages, llmSupportsVision } from '../../src/multiModalUtils'
-import {
-    ICommonObject,
-    IDatabaseEntity,
-    INodeData,
-    ISeqAgentsState,
-    IVisionChatModal,
-    ConversationHistorySelection
-} from '../../src/Interface'
+import { ICommonObject, IDatabaseEntity, INodeData, ISeqAgentsState, ConversationHistorySelection } from '../../src/Interface'
 import { getVars, executeJavaScriptCode, createCodeExecutionSandbox } from '../../src/utils'
 import { ChatPromptTemplate, BaseMessagePromptTemplateLike } from '@langchain/core/prompts'
 
@@ -136,14 +129,7 @@ export const processImageMessage = async (llm: BaseChatModel, nodeData: INodeDat
     let multiModalMessageContent: MessageContentImageUrl[] = []
 
     if (llmSupportsVision(llm)) {
-        const visionChatModel = llm as IVisionChatModal
         multiModalMessageContent = await addImagesToMessages(nodeData, options, llm.multiModalOption)
-
-        if (multiModalMessageContent?.length) {
-            visionChatModel.setVisionModel()
-        } else {
-            visionChatModel.revertToOriginalModel()
-        }
     }
 
     return multiModalMessageContent
@@ -238,7 +224,7 @@ export function filterConversationHistory(
 export const restructureMessages = (llm: BaseChatModel, state: ISeqAgentsState) => {
     const messages: BaseMessage[] = []
     for (const message of state.messages as unknown as BaseMessage[]) {
-        // Sometimes Anthropic can return a message with content types of array, ignore that EXECEPT when tool calls are present
+        // Sometimes Anthropic can return a message with content types of array, ignore that EXCEPT when tool calls are present
         if ((message as any).tool_calls?.length && message.content !== '') {
             message.content = JSON.stringify(message.content)
         }
@@ -396,9 +382,7 @@ export const checkMessageHistory = async (
         const sandbox = createCodeExecutionSandbox('', variables, flow)
 
         try {
-            const response = await executeJavaScriptCode(messageHistory, sandbox, {
-                timeout: 10000
-            })
+            const response = await executeJavaScriptCode(messageHistory, sandbox)
 
             if (!Array.isArray(response)) throw new Error('Returned message history must be an array')
             if (sysPrompt) {

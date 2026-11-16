@@ -4,8 +4,8 @@ import {
     UnstructuredLoaderOptions,
     UnstructuredLoaderStrategy
 } from '@langchain/community/document_loaders/fs/unstructured'
-import { BaseDocumentLoader } from 'langchain/document_loaders/base'
-import { StringWithAutocomplete } from 'langchain/dist/util/types'
+import { BaseDocumentLoader } from '@langchain/classic/document_loaders/base'
+import { StringWithAutocomplete } from '@langchain/core/utils/types'
 import { Document } from '@langchain/core/documents'
 
 /**
@@ -27,8 +27,6 @@ type Element = {
 }
 
 export class UnstructuredLoader extends BaseDocumentLoader {
-    public filePath: string
-
     private apiUrl = process.env.UNSTRUCTURED_API_URL || 'https://api.unstructuredapp.io/general/v0/general'
 
     private apiKey: string | undefined = process.env.UNSTRUCTURED_API_KEY
@@ -85,7 +83,7 @@ export class UnstructuredLoader extends BaseDocumentLoader {
 
     async _partition(buffer: Buffer, fileName: string): Promise<Element[]> {
         const formData = new FormData()
-        formData.append('files', new Blob([buffer]), fileName)
+        formData.append('files', new Blob([new Uint8Array(buffer)]), fileName)
         formData.append('strategy', this.strategy)
         this.ocrLanguages.forEach((language) => {
             formData.append('ocr_languages', language)
@@ -138,7 +136,7 @@ export class UnstructuredLoader extends BaseDocumentLoader {
         })
 
         if (!response.ok) {
-            throw new Error(`Failed to partition file ${this.filePath} with error ${response.status} and message ${await response.text()}`)
+            throw new Error(`Failed to partition file with error ${response.status} and message ${await response.text()}`)
         }
 
         const elements = await response.json()

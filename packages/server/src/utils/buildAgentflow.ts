@@ -11,7 +11,8 @@ import {
     IMessage,
     IServerSideEventStreamer,
     convertChatHistoryToText,
-    generateFollowUpPrompts
+    generateFollowUpPrompts,
+    tracingEnvEnabled
 } from 'flowise-components'
 import {
     IncomingAgentflowInput,
@@ -29,7 +30,8 @@ import {
     IComponentNodes,
     INodeOverrides,
     IVariableOverride,
-    INodeDirectedGraph
+    INodeDirectedGraph,
+    StartInputType
 } from '../Interface'
 import {
     RUNTIME_MESSAGES_LENGTH_VAR_PREFIX,
@@ -43,7 +45,8 @@ import {
     QUESTION_VAR_PREFIX,
     CURRENT_DATE_TIME_VAR_PREFIX,
     _removeCredentialId,
-    validateHistorySchema
+    validateHistorySchema,
+    LOOP_COUNT_VAR_PREFIX
 } from '.'
 import { ChatFlow } from '../database/entities/ChatFlow'
 import { Variable } from '../database/entities/Variable'
@@ -57,6 +60,9 @@ import { ChatMessage } from '../database/entities/ChatMessage'
 import { Telemetry } from './telemetry'
 import { getWorkspaceSearchOptions } from '../enterprise/utils/ControllerServiceUtils'
 import { UsageCacheManager } from '../UsageCacheManager'
+import { generateTTSForResponseStream, shouldAutoPlayTTS } from './buildChatflow'
+import { InternalFlowiseError } from '../errors/internalFlowiseError'
+import { StatusCodes } from 'http-status-codes'
 
 interface IWaitingNode {
     nodeId: string
@@ -84,12 +90,36 @@ interface IProcessNodeOutputsParams {
     waitingNodes: Map<string, IWaitingNode>
     loopCounts: Map<string, number>
     abortController?: AbortController
+    sseStreamer?: IServerSideEventStreamer
+    chatId: string
 }
 
 interface IAgentFlowRuntime {
     state?: ICommonObject
     chatHistory?: IMessage[]
     form?: Record<string, any>
+    webhook?: Record<string, any>
+}
+
+/**
+ * Resolves {{ $webhook.body.* }}, {{ $webhook.headers.* }}, {{ $webhook.query.* }} references in a
+ * template string against an incoming webhook payload. Used to pre-resolve webhookDefaultInput
+ * before any node runs, so the Start node's run() and downstream finalInput see the same value.
+ * Unknown references are left as-is.
+ */
+const resolveWebhookRefs = (template: string, webhook: Record<string, any> | undefined | null): string => {
+    if (!template) return ''
+    if (!webhook) return template
+    return template.replace(/{{(.*?)}}/g, (match, ref) => {
+        const path = ref.trim()
+        if (!path.startsWith('$webhook.')) return match
+        // Block prototype-walking paths defensively — lodash.get follows __proto__/constructor/prototype.
+        const subPath = path.replace('$webhook.', '')
+        if (/(^|\.)(__proto__|constructor|prototype)(\.|$)/.test(subPath)) return match
+        const val = get(webhook, subPath)
+        if (val == null) return match
+        return Array.isArray(val) || (typeof val === 'object' && val !== null) ? JSON.stringify(val) : String(val)
+    })
 }
 
 interface IExecuteNodeParams {
@@ -130,6 +160,7 @@ interface IExecuteNodeParams {
     parentExecutionId?: string
     isRecursive?: boolean
     iterationContext?: ICommonObject
+    loopCounts?: Map<string, number>
     orgId: string
     workspaceId: string
     subscriptionId: string
@@ -218,7 +249,9 @@ export const resolveVariables = async (
     chatHistory: IMessage[],
     componentNodes: IComponentNodes,
     agentFlowExecutedData?: IAgentflowExecutedData[],
-    iterationContext?: ICommonObject
+    iterationContext?: ICommonObject,
+    loopCounts?: Map<string, number>,
+    webhook?: Record<string, any>
 ): Promise<INodeData> => {
     let flowNodeData = cloneDeep(reactFlowNodeData)
     const types = 'inputs'
@@ -241,10 +274,16 @@ export const resolveVariables = async (
         // If value is not a string, return as is
         if (typeof value !== 'string') return value
 
-        const turndownService = new TurndownService()
-        value = turndownService.turndown(value)
-        // After conversion, replace any escaped underscores with regular underscores
-        value = value.replace(/\\_/g, '_')
+        // Convert legacy HTML content to markdown, preserving any markdown syntax within.
+        // Legacy content from old getHTML() starts with a TipTap block tag (e.g. <p>text</p>).
+        // Anchor with ^ to avoid matching intentional HTML/XML tags in user prompts
+        // (e.g. <instruction><div>...</div></instruction>).
+        if (/^\s*<(?:p|div|h[1-6]|ul|ol|blockquote|pre|table)\b/i.test(value)) {
+            const turndownService = new TurndownService()
+            // Disable escaping so markdown characters (e.g. ###, -, *) inside HTML are preserved as-is
+            turndownService.escape = (str: string) => str
+            value = turndownService.turndown(value)
+        }
 
         const matches = value.match(/{{(.*?)}}/g)
 
@@ -273,6 +312,17 @@ export const resolveVariables = async (
                 }
             }
 
+            if (variableFullPath.startsWith('$webhook.')) {
+                const variableValue = get(webhook, variableFullPath.replace('$webhook.', ''))
+                if (variableValue != null) {
+                    const formattedValue =
+                        Array.isArray(variableValue) || (typeof variableValue === 'object' && variableValue !== null)
+                            ? JSON.stringify(variableValue)
+                            : variableValue
+                    resolvedValue = resolvedValue.replace(match, formattedValue)
+                }
+            }
+
             if (variableFullPath === FILE_ATTACHMENT_PREFIX) {
                 resolvedValue = resolvedValue.replace(match, uploadedFilesContent)
             }
@@ -283,6 +333,20 @@ export const resolveVariables = async (
 
             if (variableFullPath === RUNTIME_MESSAGES_LENGTH_VAR_PREFIX) {
                 resolvedValue = resolvedValue.replace(match, flowConfig?.runtimeChatHistoryLength ?? 0)
+            }
+
+            if (variableFullPath === LOOP_COUNT_VAR_PREFIX) {
+                // Get the current loop count from the most recent loopAgentflow node execution
+                let currentLoopCount = 0
+                if (loopCounts && agentFlowExecutedData) {
+                    // Find the most recent loopAgentflow node execution to get its loop count
+                    const loopNodes = [...agentFlowExecutedData].reverse().filter((data) => data.data?.name === 'loopAgentflow')
+                    if (loopNodes.length > 0) {
+                        const latestLoopNode = loopNodes[0]
+                        currentLoopCount = loopCounts.get(latestLoopNode.nodeId) || 0
+                    }
+                }
+                resolvedValue = resolvedValue.replace(match, currentLoopCount.toString())
             }
 
             if (variableFullPath === CURRENT_DATE_TIME_VAR_PREFIX) {
@@ -341,7 +405,7 @@ export const resolveVariables = async (
                 // Extract nodeId and outputPath from the match
                 const [, nodeIdPart, outputPath] = outputMatch
                 // Clean nodeId (handle escaped underscores)
-                const cleanNodeId = nodeIdPart.replace('\\', '')
+                const cleanNodeId = nodeIdPart.replace(/\\/g, '')
 
                 // Find the last (most recent) matching node data instead of the first one
                 const nodeData = [...agentFlowExecutedData].reverse().find((d) => d.nodeId === cleanNodeId)
@@ -369,7 +433,7 @@ export const resolveVariables = async (
 
             // Find node data in executed data
             // sometimes turndown value returns a backslash like `llmAgentflow\_1`, remove the backslash
-            const cleanNodeId = variableFullPath.replace('\\', '')
+            const cleanNodeId = variableFullPath.replace(/\\/g, '')
             // Find the last (most recent) matching node data instead of the first one
             const nodeData = agentFlowExecutedData
                 ? [...agentFlowExecutedData].reverse().find((data) => data.nodeId === cleanNodeId)
@@ -469,6 +533,14 @@ export const resolveVariables = async (
                 return
             }
 
+            // Handle arrays of config objects
+            if (Array.isArray(configObj)) {
+                for (const item of configObj) {
+                    await processConfigParams(item, configParamWithAcceptVariables)
+                }
+                return
+            }
+
             for (const [key, value] of Object.entries(configObj)) {
                 // Only resolve variables for parameters that accept them
                 // Example: requestsGetHeaders is in configParamWithAcceptVariables, so resolve "Bearer {{ $vars.TOKEN }}"
@@ -508,12 +580,44 @@ export const resolveVariables = async (
                 // STEP 5: Look for the config object (paramName + "Config")
                 // Example: Look for "agentSelectedToolConfig" in the inputs
                 const configParamName = paramWithLoadConfig + 'Config'
-                const configValue = findParamValue(paramsObj, configParamName)
 
-                // STEP 6: Process config object to resolve variables
+                // Find all config values (handle arrays)
+                const findAllConfigValues = (obj: any, paramName: string): any[] => {
+                    const results: any[] = []
+
+                    if (typeof obj !== 'object' || obj === null) {
+                        return results
+                    }
+
+                    // Handle arrays (e.g., agentTools array)
+                    if (Array.isArray(obj)) {
+                        for (const item of obj) {
+                            results.push(...findAllConfigValues(item, paramName))
+                        }
+                        return results
+                    }
+
+                    // Direct property match
+                    if (Object.prototype.hasOwnProperty.call(obj, paramName)) {
+                        results.push(obj[paramName])
+                    }
+
+                    // Recursively search nested objects
+                    for (const value of Object.values(obj)) {
+                        results.push(...findAllConfigValues(value, paramName))
+                    }
+
+                    return results
+                }
+
+                const configValues = findAllConfigValues(paramsObj, configParamName)
+
+                // STEP 6: Process all config objects to resolve variables
                 // Example: Resolve "Bearer {{ $vars.TOKEN }}" in requestsGetHeaders
-                if (configValue && configParamWithAcceptVariables.length > 0) {
-                    await processConfigParams(configValue, configParamWithAcceptVariables)
+                if (configValues.length > 0 && configParamWithAcceptVariables.length > 0) {
+                    for (const configValue of configValues) {
+                        await processConfigParams(configValue, configParamWithAcceptVariables)
+                    }
                 }
             }
         }
@@ -709,12 +813,20 @@ async function determineNodesToIgnore(
     if (isDecisionNode && result.output?.conditions) {
         const outputConditions: ICondition[] = result.output.conditions
 
+        // safety net: if no conditions were fulfilled, don't ignore ALL children
+        // treat the last condition as an else/default fallback
+        const anyFulfilled = outputConditions.some((c) => c.isFulfilled === true)
+        if (!anyFulfilled && outputConditions.length > 0) {
+            // mark the last condition as fulfilled so at least one branch executes
+            outputConditions[outputConditions.length - 1].isFulfilled = true
+        }
+
         // Find indexes of unfulfilled conditions
         const unfulfilledIndexes = outputConditions
-            .map((condition: any, index: number) =>
+            .map((condition, index) =>
                 condition.isFulfilled === false || !Object.prototype.hasOwnProperty.call(condition, 'isFulfilled') ? index : -1
             )
-            .filter((index: number) => index !== -1)
+            .filter((index) => index !== -1)
 
         // Find nodes to ignore based on unfulfilled conditions
         for (const index of unfulfilledIndexes) {
@@ -742,7 +854,9 @@ async function processNodeOutputs({
     edges,
     nodeExecutionQueue,
     waitingNodes,
-    loopCounts
+    loopCounts,
+    sseStreamer,
+    chatId
 }: IProcessNodeOutputsParams): Promise<{ humanInput?: IHumanInput }> {
     logger.debug(`\n🔄 Processing outputs from node: ${nodeId}`)
 
@@ -823,6 +937,11 @@ async function processNodeOutputs({
             }
         } else {
             logger.debug(`    ⚠️ Maximum loop count (${maxLoop}) reached, stopping loop`)
+            const fallbackMessage = result.output.fallbackMessage || `Loop completed after reaching maximum iteration count of ${maxLoop}.`
+            if (sseStreamer) {
+                sseStreamer.streamTokenEvent(chatId, fallbackMessage)
+            }
+            result.output = { ...result.output, content: fallbackMessage }
         }
     }
 
@@ -967,6 +1086,7 @@ const executeNode = async ({
     isInternal,
     isRecursive,
     iterationContext,
+    loopCounts,
     orgId,
     workspaceId,
     subscriptionId,
@@ -1017,8 +1137,7 @@ const executeNode = async ({
             apiMessageId,
             chatHistory,
             runtimeChatHistoryLength: Math.max(0, runtimeChatHistory.length - 1),
-            state: updatedState,
-            ...overrideConfig
+            state: updatedState
         }
         if (
             iterationContext &&
@@ -1027,17 +1146,30 @@ const executeNode = async ({
             Object.keys(iterationContext.agentflowRuntime.state).length > 0
         ) {
             updatedState = {
-                ...updatedState,
-                ...iterationContext.agentflowRuntime.state
+                ...iterationContext.agentflowRuntime.state,
+                ...updatedState
             }
             flowConfig.state = updatedState
+            agentflowRuntime.state = updatedState
         }
 
         // Resolve variables in node data
+        let formValue: Record<string, any> = {}
+        if (isObjectNotEmpty(incomingInput.form)) {
+            formValue = incomingInput.form as Record<string, any>
+        } else if (isObjectNotEmpty(agentflowRuntime.form)) {
+            formValue = agentflowRuntime.form as Record<string, any>
+        }
+        let webhookValue: Record<string, any> = {}
+        if (isObjectNotEmpty(incomingInput.webhook)) {
+            webhookValue = incomingInput.webhook as Record<string, any>
+        } else if (isObjectNotEmpty(agentflowRuntime.webhook)) {
+            webhookValue = agentflowRuntime.webhook as Record<string, any>
+        }
         const reactFlowNodeData: INodeData = await resolveVariables(
             flowNodeData,
             incomingInput.question ?? '',
-            incomingInput.form ?? agentflowRuntime.form ?? {},
+            formValue,
             flowConfig,
             availableVariables,
             variableOverrides,
@@ -1045,7 +1177,9 @@ const executeNode = async ({
             chatHistory,
             componentNodes,
             agentFlowExecutedData,
-            iterationContext
+            iterationContext,
+            loopCounts,
+            webhookValue
         )
 
         // Handle human input if present
@@ -1073,7 +1207,7 @@ const executeNode = async ({
             !isRecursive &&
             (!graph[nodeId] || graph[nodeId].length === 0 || (!humanInput && reactFlowNode.data.name === 'humanInputAgentflow'))
 
-        if (incomingInput.question && incomingInput.form) {
+        if (incomingInput.question && isObjectNotEmpty(incomingInput.form)) {
             throw new Error('Question and form cannot be provided at the same time')
         }
 
@@ -1081,10 +1215,12 @@ const executeNode = async ({
         if (incomingInput.question) {
             // Prepare final question with uploaded content if any
             finalInput = uploadedFilesContent ? `${uploadedFilesContent}\n\n${incomingInput.question}` : incomingInput.question
-        } else if (incomingInput.form) {
+        } else if (isObjectNotEmpty(incomingInput.form)) {
             finalInput = Object.entries(incomingInput.form || {})
                 .map(([key, value]) => `${key}: ${value}`)
                 .join('\n')
+        } else if (incomingInput.webhook) {
+            finalInput = JSON.stringify(incomingInput.webhook)
         }
 
         // Prepare run parameters
@@ -1166,7 +1302,8 @@ const executeNode = async ({
                         index: i,
                         value: item,
                         isFirst: i === 0,
-                        isLast: i === results.input.iterationInput.length - 1
+                        isLast: i === results.input.iterationInput.length - 1,
+                        sessionId: sessionId
                     }
 
                     try {
@@ -1421,6 +1558,7 @@ export const executeAgentFlow = async ({
     parentExecutionId,
     iterationContext,
     isTool = false,
+    chatType,
     orgId,
     workspaceId,
     subscriptionId,
@@ -1434,7 +1572,7 @@ export const executeAgentFlow = async ({
     const uploads = incomingInput.uploads
     const userMessageDateTime = new Date()
     const chatflowid = chatflow.id
-    const sessionId = overrideConfig.sessionId || chatId
+    const sessionId = iterationContext?.sessionId || overrideConfig.sessionId || chatId
     const humanInput: IHumanInput | undefined = incomingInput.humanInput
 
     // Validate history schema if provided
@@ -1456,11 +1594,26 @@ export const executeAgentFlow = async ({
     const edges = parsedFlowData.edges
     const { graph, nodeDependencies } = constructGraphs(nodes, edges)
     const { graph: reversedGraph } = constructGraphs(nodes, edges, { isReversed: true })
-    const startInputType = nodes.find((node) => node.data.name === 'startAgentflow')?.data.inputs?.startInputType as
-        | 'chatInput'
-        | 'formInput'
+    const startNode = nodes.find((node) => node.data.name === 'startAgentflow')
+    const startInputType = startNode?.data.inputs?.startInputType as StartInputType | undefined
     if (!startInputType && !isRecursive) {
         throw new Error('Start input type not found')
+    }
+
+    if (!isRecursive) {
+        if (startInputType === 'webhookTrigger' && chatType !== ChatType.WEBHOOK) {
+            const configuredMethod = ((startNode?.data?.inputs?.webhookMethod as string) || 'POST').toUpperCase()
+            throw new InternalFlowiseError(
+                StatusCodes.BAD_REQUEST,
+                `This flow is configured as a Webhook Trigger. Call ${configuredMethod} /api/v1/webhook/${chatflowid} instead of the prediction API.`
+            )
+        }
+        if (startInputType === 'scheduleInput' && chatType !== ChatType.SCHEDULED) {
+            throw new InternalFlowiseError(
+                StatusCodes.BAD_REQUEST,
+                `This flow is configured as a Scheduled Trigger. It is fired by the scheduler and cannot be invoked via the API. Change the Start node Input Type to Chat or Form to call it from the prediction API.`
+            )
+        }
     }
     // @ts-ignore
     if (isTool) sseStreamer = undefined // If the request is from ChatflowTool, don't stream the response
@@ -1502,7 +1655,8 @@ export const executeAgentFlow = async ({
     let agentflowRuntime: IAgentFlowRuntime = {
         state: {},
         chatHistory: [],
-        form: {}
+        form: {},
+        webhook: {}
     }
 
     let previousExecution: Execution | undefined
@@ -1585,8 +1739,40 @@ export const executeAgentFlow = async ({
         }
     }
 
+    // On webhook humanInput resume, restore the original trigger's webhook data so $webhook.body.*,
+    // $webhook.headers.*, $webhook.query.* and $flow.input resolve to the original trigger values.
+    // incomingInput.webhook is always present on webhook calls so we overwrite it directly rather
+    // than relying on the agentflowRuntime.webhook fallback (unlike the formInput pattern).
+    if (startInputType === 'webhookTrigger' && humanInput && previousExecution) {
+        const previousExecutionData = (JSON.parse(previousExecution.executionData) as IAgentflowExecutedData[]) ?? []
+
+        const previousStartAgent = previousExecutionData.find((execData) => execData.data.name === 'startAgentflow')
+
+        if (previousStartAgent) {
+            const previousStartAgentOutput = previousStartAgent.data.output
+            if (previousStartAgentOutput && typeof previousStartAgentOutput === 'object' && 'webhook' in previousStartAgentOutput) {
+                incomingInput.webhook = previousStartAgentOutput.webhook as Record<string, any>
+            }
+        }
+    }
+
+    if (startInputType === 'webhookTrigger' && !humanInput) {
+        const webhookInputMode = (startNode?.data?.inputs?.webhookInputMode as string) || 'text'
+        if (webhookInputMode === 'text') {
+            const template = (startNode?.data?.inputs?.webhookDefaultInput as string) || ''
+            incomingInput.question = resolveWebhookRefs(template, incomingInput.webhook) || ' '
+        } else if (webhookInputMode === 'none') {
+            incomingInput.question = ' '
+        }
+    }
+
+    if (incomingInput.webhook && Object.keys(incomingInput.webhook).length) {
+        agentflowRuntime.webhook = incomingInput.webhook
+    }
+
     // If it is human input, find the last checkpoint and resume
-    if (humanInput) {
+    // Skip human input resumption for recursive iteration calls - they should start fresh
+    if (humanInput && !(isRecursive && iterationContext)) {
         if (!previousExecution) {
             throw new Error(`No previous execution found for session ${sessionId}`)
         }
@@ -1697,7 +1883,7 @@ export const executeAgentFlow = async ({
         })
 
         if (parentExecution) {
-            logger.debug(`   📝 Using parent execution ID: ${parentExecutionId} for recursive call`)
+            logger.debug(`   📝 Using parent execution ID: ${parentExecutionId} for recursive call (iteration: ${!!iterationContext})`)
             newExecution = parentExecution
         } else {
             console.warn(`   ⚠️ Parent execution ID ${parentExecutionId} not found, will create new execution`)
@@ -1792,11 +1978,16 @@ export const executeAgentFlow = async ({
     let iterations = 0
     let currentHumanInput = humanInput
 
+    // For iteration calls, clear human input since they should start fresh
+    if (isRecursive && iterationContext && humanInput) {
+        currentHumanInput = undefined
+    }
+
     let analyticHandlers: AnalyticHandler | undefined
     let parentTraceIds: ICommonObject | undefined
 
     try {
-        if (chatflow.analytic) {
+        if (chatflow.analytic || tracingEnvEnabled()) {
             // Override config analytics
             let analyticInputs: ICommonObject = {}
             if (overrideConfig?.analytics && Object.keys(overrideConfig.analytics).length > 0) {
@@ -1814,10 +2005,13 @@ export const executeAgentFlow = async ({
                 chatId
             })
             await analyticHandlers.init()
-            parentTraceIds = await analyticHandlers.onChainStart(
-                'Agentflow',
-                form && Object.keys(form).length > 0 ? JSON.stringify(form) : question || ''
-            )
+            if (analyticHandlers?.hasActiveProviders()) {
+                const flowName = chatflow.name || 'Agentflow'
+                parentTraceIds = await analyticHandlers.onChainStart(
+                    flowName,
+                    form && Object.keys(form).length > 0 ? JSON.stringify(form) : question || ''
+                )
+            }
         }
     } catch (error) {
         logger.error(`[server]: Error initializing analytic handlers: ${getErrorMessage(error)}`)
@@ -1889,6 +2083,7 @@ export const executeAgentFlow = async ({
                 analyticHandlers,
                 isRecursive,
                 iterationContext,
+                loopCounts,
                 orgId,
                 workspaceId,
                 subscriptionId,
@@ -1957,7 +2152,8 @@ export const executeAgentFlow = async ({
                 nodeExecutionQueue,
                 waitingNodes,
                 loopCounts,
-                abortController
+                sseStreamer,
+                chatId
             })
 
             // Update humanInput if it was changed
@@ -2044,7 +2240,62 @@ export const executeAgentFlow = async ({
 
     // check if last agentFlowExecutedData.data.output contains the key "content"
     const lastNodeOutput = agentFlowExecutedData[agentFlowExecutedData.length - 1].data?.output as ICommonObject | undefined
-    const content = (lastNodeOutput?.content as string) ?? ' '
+    let content = (lastNodeOutput?.content as string) ?? ' '
+
+    /* Check for post-processing settings */
+    let chatflowConfig: ICommonObject = {}
+    try {
+        if (chatflow.chatbotConfig) {
+            chatflowConfig = typeof chatflow.chatbotConfig === 'string' ? JSON.parse(chatflow.chatbotConfig) : chatflow.chatbotConfig
+        }
+    } catch (e) {
+        logger.error('[server]: Error parsing chatflow config:', e)
+    }
+
+    if (chatflowConfig?.postProcessing?.enabled === true && content) {
+        try {
+            const postProcessingFunction = JSON.parse(chatflowConfig?.postProcessing?.customFunction)
+            const nodeInstanceFilePath = componentNodes['customFunctionAgentflow'].filePath as string
+            const nodeModule = await import(nodeInstanceFilePath)
+            //set the outputs.output to EndingNode to prevent json escaping of content...
+            const nodeData = {
+                inputs: { customFunctionJavascriptFunction: postProcessingFunction }
+            }
+            const runtimeChatHistory = agentflowRuntime.chatHistory || []
+            const chatHistory = [...pastChatHistory, ...runtimeChatHistory]
+            const options: ICommonObject = {
+                chatflowid: chatflow.id,
+                sessionId,
+                chatId,
+                input: question || form,
+                postProcessing: {
+                    rawOutput: content,
+                    chatHistory: cloneDeep(chatHistory),
+                    sourceDocuments: lastNodeOutput?.sourceDocuments ? cloneDeep(lastNodeOutput.sourceDocuments) : undefined,
+                    usedTools: lastNodeOutput?.usedTools ? cloneDeep(lastNodeOutput.usedTools) : undefined,
+                    artifacts: lastNodeOutput?.artifacts ? cloneDeep(lastNodeOutput.artifacts) : undefined,
+                    fileAnnotations: lastNodeOutput?.fileAnnotations ? cloneDeep(lastNodeOutput.fileAnnotations) : undefined
+                },
+                appDataSource,
+                databaseEntities,
+                workspaceId,
+                orgId,
+                logger
+            }
+            const customFuncNodeInstance = new nodeModule.nodeClass()
+            const customFunctionResponse = await customFuncNodeInstance.run(nodeData, question || form, options)
+            const moderatedResponse = customFunctionResponse.output.content
+            if (typeof moderatedResponse === 'string') {
+                content = moderatedResponse
+            } else if (typeof moderatedResponse === 'object') {
+                content = '```json\n' + JSON.stringify(moderatedResponse, null, 2) + '\n```'
+            } else {
+                content = moderatedResponse
+            }
+        } catch (e) {
+            logger.error('[server]: Post Processing Error:', e)
+        }
+    }
 
     // remove credentialId from agentFlowExecutedData
     agentFlowExecutedData = agentFlowExecutedData.map((data) => _removeCredentialId(data))
@@ -2100,13 +2351,20 @@ export const executeAgentFlow = async ({
         } else {
             finalUserInput = question || humanInput?.feedback || ' '
         }
+    } else if (startInputType === 'webhookTrigger') {
+        const webhookInputMode = (startNode?.data?.inputs?.webhookInputMode as string) || 'text'
+        if (webhookInputMode === 'payload') {
+            finalUserInput = incomingInput.webhook ? JSON.stringify(incomingInput.webhook) : ' '
+        } else {
+            finalUserInput = humanInput?.feedback || incomingInput.question || ' '
+        }
     }
 
     const userMessage: Omit<IChatMessage, 'id'> = {
         role: 'userMessage',
         content: finalUserInput,
         chatflowid,
-        chatType: evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
+        chatType: chatType || (evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
         chatId,
         sessionId,
         createdDate: userMessageDateTime,
@@ -2121,7 +2379,7 @@ export const executeAgentFlow = async ({
         role: 'apiMessage',
         content: content,
         chatflowid,
-        chatType: evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
+        chatType: chatType || (evaluationRunId ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
         chatId,
         sessionId,
         executionId: newExecution.id
@@ -2130,6 +2388,7 @@ export const executeAgentFlow = async ({
     if (lastNodeOutput?.usedTools) apiMessage.usedTools = JSON.stringify(lastNodeOutput.usedTools)
     if (lastNodeOutput?.fileAnnotations) apiMessage.fileAnnotations = JSON.stringify(lastNodeOutput.fileAnnotations)
     if (lastNodeOutput?.artifacts) apiMessage.artifacts = JSON.stringify(lastNodeOutput.artifacts)
+    if (lastNodeOutput?.reasonContent) apiMessage.reasonContent = JSON.stringify(lastNodeOutput.reasonContent)
     if (chatflow.followUpPrompts) {
         const followUpPromptsConfig = JSON.parse(chatflow.followUpPrompts)
         const followUpPrompts = await generateFollowUpPrompts(followUpPromptsConfig, apiMessage.content, {
@@ -2175,8 +2434,38 @@ export const executeAgentFlow = async ({
     result.followUpPrompts = JSON.stringify(apiMessage.followUpPrompts)
     result.executionId = newExecution.id
     result.agentFlowExecutedData = agentFlowExecutedData
+    if (apiMessage.action) result.action = JSON.parse(apiMessage.action)
 
     if (sessionId) result.sessionId = sessionId
 
+    if (shouldAutoPlayTTS(chatflow.textToSpeech) && result.text) {
+        const options = {
+            orgId,
+            chatflowid,
+            chatId,
+            appDataSource,
+            databaseEntities
+        }
+
+        if (sseStreamer) {
+            await generateTTSForResponseStream(
+                result.text,
+                chatflow.textToSpeech,
+                options,
+                chatId,
+                chatMessage?.id,
+                sseStreamer,
+                abortController
+            )
+        }
+    }
+
     return result
+}
+
+/**
+ * Utility function to check if an object is not empty, null, or undefined
+ */
+export const isObjectNotEmpty = (obj: any): boolean => {
+    return obj && Object.keys(obj).length > 0 && obj.constructor === Object
 }

@@ -2,10 +2,11 @@ import { Request } from 'express'
 import * as path from 'path'
 import { DataSource } from 'typeorm'
 import { v4 as uuidv4 } from 'uuid'
-import { omit } from 'lodash'
+import { omit, cloneDeep } from 'lodash'
 import {
     IFileUpload,
     convertSpeechToText,
+    convertTextToSpeechStream,
     ICommonObject,
     addSingleFileToStorage,
     generateFollowUpPrompts,
@@ -16,7 +17,8 @@ import {
     getFileFromUpload,
     removeSpecificFileFromUpload,
     EvaluationRunner,
-    handleEscapeCharacters
+    handleEscapeCharacters,
+    IServerSideEventStreamer
 } from 'flowise-components'
 import { StatusCodes } from 'http-status-codes'
 import {
@@ -57,6 +59,7 @@ import {
     constructGraphs,
     getAPIOverrideConfig
 } from '../utils'
+import { validateFileMimeTypeAndExtensionMatch } from './fileValidation'
 import { validateFlowAPIKey } from './validateKey'
 import logger from './logger'
 import { utilAddChatMessage } from './addChatMesage'
@@ -70,9 +73,74 @@ import { executeAgentFlow } from './buildAgentflow'
 import { Workspace } from '../enterprise/database/entities/workspace.entity'
 import { Organization } from '../enterprise/database/entities/organization.entity'
 
-/*
- * Initialize the ending node to be executed
- */
+const shouldAutoPlayTTS = (textToSpeechConfig: string | undefined | null): boolean => {
+    if (!textToSpeechConfig) return false
+    try {
+        const config = typeof textToSpeechConfig === 'string' ? JSON.parse(textToSpeechConfig) : textToSpeechConfig
+        for (const providerKey in config) {
+            const provider = config[providerKey]
+            if (provider && provider.status === true && provider.autoPlay === true) {
+                return true
+            }
+        }
+        return false
+    } catch (error) {
+        logger.error(`Error parsing textToSpeechConfig: ${getErrorMessage(error)}`)
+        return false
+    }
+}
+
+const generateTTSForResponseStream = async (
+    responseText: string,
+    textToSpeechConfig: string | undefined,
+    options: ICommonObject,
+    chatId: string,
+    chatMessageId: string,
+    sseStreamer: IServerSideEventStreamer,
+    abortController?: AbortController
+): Promise<void> => {
+    try {
+        if (!textToSpeechConfig) return
+        const config = typeof textToSpeechConfig === 'string' ? JSON.parse(textToSpeechConfig) : textToSpeechConfig
+
+        let activeProviderConfig = null
+        for (const providerKey in config) {
+            const provider = config[providerKey]
+            if (provider && provider.status === true) {
+                activeProviderConfig = {
+                    name: providerKey,
+                    credentialId: provider.credentialId,
+                    voice: provider.voice,
+                    model: provider.model
+                }
+                break
+            }
+        }
+
+        if (!activeProviderConfig) return
+
+        await convertTextToSpeechStream(
+            responseText,
+            activeProviderConfig,
+            options,
+            abortController || new AbortController(),
+            (format: string) => {
+                sseStreamer.streamTTSStartEvent(chatId, chatMessageId, format)
+            },
+            (chunk: Buffer) => {
+                const audioBase64 = chunk.toString('base64')
+                sseStreamer.streamTTSDataEvent(chatId, chatMessageId, audioBase64)
+            },
+            () => {
+                sseStreamer.streamTTSEndEvent(chatId, chatMessageId)
+            }
+        )
+    } catch (error) {
+        logger.error(`[server]: TTS streaming failed: ${getErrorMessage(error)}`)
+        sseStreamer.streamTTSEndEvent(chatId, chatMessageId)
+    }
+}
+
 const initEndingNode = async ({
     endingNodeIds,
     componentNodes,
@@ -247,6 +315,7 @@ export const executeFlow = async ({
     files,
     signal,
     isTool,
+    chatType,
     orgId,
     workspaceId,
     subscriptionId,
@@ -287,6 +356,10 @@ export const executeFlow = async ({
                 const splitDataURI = upload.data.split(',')
                 const bf = Buffer.from(splitDataURI.pop() || '', 'base64')
                 const mime = splitDataURI[0].split(':')[1].split(';')[0]
+
+                // Validate file extension, MIME type, and content to prevent security vulnerabilities
+                validateFileMimeTypeAndExtensionMatch(filename, mime)
+
                 const { totalSize } = await addSingleFileToStorage(mime, bf, filename, orgId, chatflowid, chatId)
                 await updateStorageUsage(orgId, workspaceId, totalSize, usageCacheManager)
                 upload.type = 'stored-file'
@@ -351,6 +424,10 @@ export const executeFlow = async ({
             const fileBuffer = await getFileFromUpload(file.path ?? file.key)
             // Address file name with special characters: https://github.com/expressjs/multer/issues/1104
             file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf8')
+
+            // Validate file extension, MIME type, and content to prevent security vulnerabilities
+            validateFileMimeTypeAndExtensionMatch(file.originalname, file.mimetype)
+
             const { path: storagePath, totalSize } = await addArrayFilesToStorage(
                 file.mimetype,
                 fileBuffer,
@@ -416,6 +493,7 @@ export const executeFlow = async ({
             sseStreamer,
             baseURL,
             isInternal,
+            chatType,
             uploadedFilesContent,
             fileUploads,
             signal,
@@ -484,8 +562,7 @@ export const executeFlow = async ({
         chatId,
         sessionId,
         chatHistory,
-        apiMessageId,
-        ...incomingInput.overrideConfig
+        apiMessageId
     }
 
     logger.debug(`[server]: [${orgId}]: Start building flow ${chatflowid}`)
@@ -556,7 +633,7 @@ export const executeFlow = async ({
                 role: 'userMessage',
                 content: incomingInput.question,
                 chatflowid: agentflow.id,
-                chatType: isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
+                chatType: chatType || (isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
                 chatId,
                 memoryType,
                 sessionId,
@@ -571,7 +648,7 @@ export const executeFlow = async ({
                 role: 'apiMessage',
                 content: finalResult,
                 chatflowid: agentflow.id,
-                chatType: isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
+                chatType: chatType || (isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
                 chatId,
                 memoryType,
                 sessionId
@@ -721,7 +798,7 @@ export const executeFlow = async ({
             role: 'userMessage',
             content: question,
             chatflowid,
-            chatType: isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
+            chatType: chatType || (isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
             chatId,
             memoryType,
             sessionId,
@@ -750,7 +827,14 @@ export const executeFlow = async ({
                         sessionId,
                         chatId,
                         input: question,
-                        rawOutput: resultText,
+                        postProcessing: {
+                            rawOutput: resultText,
+                            chatHistory: cloneDeep(chatHistory),
+                            sourceDocuments: result?.sourceDocuments ? cloneDeep(result.sourceDocuments) : undefined,
+                            usedTools: result?.usedTools ? cloneDeep(result.usedTools) : undefined,
+                            artifacts: result?.artifacts ? cloneDeep(result.artifacts) : undefined,
+                            fileAnnotations: result?.fileAnnotations ? cloneDeep(result.fileAnnotations) : undefined
+                        },
                         appDataSource,
                         databaseEntities,
                         workspaceId,
@@ -779,7 +863,7 @@ export const executeFlow = async ({
             role: 'apiMessage',
             content: resultText,
             chatflowid,
-            chatType: isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL,
+            chatType: chatType || (isEvaluation ? ChatType.EVALUATION : isInternal ? ChatType.INTERNAL : ChatType.EXTERNAL),
             chatId,
             memoryType,
             sessionId
@@ -788,6 +872,7 @@ export const executeFlow = async ({
         if (result?.usedTools) apiMessage.usedTools = JSON.stringify(result.usedTools)
         if (result?.fileAnnotations) apiMessage.fileAnnotations = JSON.stringify(result.fileAnnotations)
         if (result?.artifacts) apiMessage.artifacts = JSON.stringify(result.artifacts)
+        if (result?.action) apiMessage.action = typeof result.action === 'string' ? result.action : JSON.stringify(result.action)
         if (chatflow.followUpPrompts) {
             const followUpPromptsConfig = JSON.parse(chatflow.followUpPrompts)
             const followUpPrompts = await generateFollowUpPrompts(followUpPromptsConfig, apiMessage.content, {
@@ -832,6 +917,17 @@ export const executeFlow = async ({
         if (sessionId) result.sessionId = sessionId
         if (memoryType) result.memoryType = memoryType
         if (Object.keys(setVariableNodesOutput).length) result.flowVariables = setVariableNodesOutput
+
+        if (shouldAutoPlayTTS(chatflow.textToSpeech) && result.text) {
+            const options = {
+                orgId,
+                chatflowid,
+                chatId,
+                appDataSource,
+                databaseEntities
+            }
+            await generateTTSForResponseStream(result.text, chatflow.textToSpeech, options, chatId, chatMessage?.id, sseStreamer, signal)
+        }
 
         return result
     }
@@ -887,11 +983,11 @@ const checkIfStreamValid = async (
 }
 
 /**
- * Build/Data Preperation for execute function
+ * Build/Data Preparation for execute function
  * @param {Request} req
  * @param {boolean} isInternal
  */
-export const utilBuildChatflow = async (req: Request, isInternal: boolean = false): Promise<any> => {
+export const utilBuildChatflow = async (req: Request, isInternal: boolean = false, chatType?: ChatType): Promise<any> => {
     const appServer = getRunningExpressApp()
 
     const chatflowid = req.params.id
@@ -958,9 +1054,7 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
         const orgId = org.id
         organizationId = orgId
         const subscriptionId = org.subscriptionId as string
-
-        const subscriptionDetails = await appServer.usageCacheManager.getSubscriptionDataFromCache(subscriptionId)
-        const productId = subscriptionDetails?.productId || ''
+        const productId = await appServer.identityManager.getProductIdFromSubscription(subscriptionId)
 
         await checkPredictions(orgId, subscriptionId, appServer.usageCacheManager)
 
@@ -979,6 +1073,7 @@ export const utilBuildChatflow = async (req: Request, isInternal: boolean = fals
             cachePool: appServer.cachePool,
             componentNodes: appServer.nodesPool.componentNodes,
             isTool, // used to disable streaming if incoming request its from ChatflowTool
+            chatType,
             usageCacheManager: appServer.usageCacheManager,
             orgId,
             workspaceId,
@@ -1064,3 +1159,5 @@ const incrementFailedMetricCounter = (metricsProvider: IMetricsProvider, isInter
         )
     }
 }
+
+export { shouldAutoPlayTTS, generateTTSForResponseStream }

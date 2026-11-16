@@ -5,11 +5,12 @@ import {
     PlaywrightWebBaseLoaderOptions
 } from '@langchain/community/document_loaders/web/playwright'
 import { Document } from '@langchain/core/documents'
-import { TextSplitter } from 'langchain/text_splitter'
+import { TextSplitter } from '@langchain/textsplitters'
 import { test } from 'linkifyjs'
 import { omit } from 'lodash'
 import { handleEscapeCharacters, INodeOutputsValue, webCrawl, xmlScrape } from '../../../src'
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
+import { checkDenyList } from '../../../src/httpSecurity'
 
 class Playwright_DocumentLoaders implements INode {
     label: string
@@ -189,12 +190,16 @@ class Playwright_DocumentLoaders implements INode {
 
         async function playwrightLoader(url: string): Promise<Document[] | undefined> {
             try {
+                await checkDenyList(url)
                 let docs = []
+
+                const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH
+
                 const config: PlaywrightWebBaseLoaderOptions = {
                     launchOptions: {
                         args: ['--no-sandbox'],
                         headless: true,
-                        executablePath: process.env.PLAYWRIGHT_EXECUTABLE_FILE_PATH
+                        executablePath: executablePath
                     }
                 }
                 if (waitUntilGoToOption) {
@@ -221,6 +226,32 @@ class Playwright_DocumentLoaders implements INode {
                     }
                 }
                 const loader = new PlaywrightWebBaseLoader(url, config)
+                loader.scrape = async (): Promise<string> => {
+                    const { chromium } = await PlaywrightWebBaseLoader.imports()
+                    const browser = await chromium.launch({
+                        headless: true,
+                        ...config.launchOptions
+                    })
+                    try {
+                        const page = await browser.newPage()
+                        await page.route('**', async (route, request) => {
+                            try {
+                                await checkDenyList(request.url())
+                                await route.continue()
+                            } catch {
+                                await route.abort('blockedbyclient')
+                            }
+                        })
+                        const response = await page.goto(url, {
+                            timeout: 180000,
+                            waitUntil: 'domcontentloaded',
+                            ...config.gotoOptions
+                        })
+                        return config.evaluate ? await config.evaluate(page, browser, response) : await page.content()
+                    } finally {
+                        await browser.close()
+                    }
+                }
                 if (textSplitter) {
                     docs = await loader.load()
                     docs = await textSplitter.splitDocuments(docs)

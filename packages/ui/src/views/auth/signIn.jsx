@@ -14,6 +14,7 @@ import { Input } from '@/ui-component/input/Input'
 // Hooks
 import useApi from '@/hooks/useApi'
 import { useConfig } from '@/store/context/ConfigContext'
+import { useError } from '@/store/context/ErrorContext'
 
 // API
 import authApi from '@/api/auth'
@@ -52,7 +53,8 @@ const SignInPage = () => {
         label: 'Password',
         name: 'password',
         type: 'password',
-        placeholder: '********'
+        placeholder: '********',
+        enablePasswordToggle: true
     }
     const [usernameVal, setUsernameVal] = useState('')
     const [passwordVal, setPasswordVal] = useState('')
@@ -61,6 +63,8 @@ const SignInPage = () => {
     const [loading, setLoading] = useState(false)
     const [showResendButton, setShowResendButton] = useState(false)
     const [successMessage, setSuccessMessage] = useState('')
+
+    const { authRateLimitError, setAuthRateLimitError } = useError()
 
     const loginApi = useApi(authApi.login)
     const ssoLoginApi = useApi(ssoApi.ssoLogin)
@@ -71,6 +75,7 @@ const SignInPage = () => {
 
     const doLogin = (event) => {
         event.preventDefault()
+        setAuthRateLimitError(null)
         setLoading(true)
         const body = {
             email: usernameVal,
@@ -92,11 +97,12 @@ const SignInPage = () => {
 
     useEffect(() => {
         store.dispatch(logoutSuccess())
+        setAuthRateLimitError(null)
         if (!isOpenSource) {
             getDefaultProvidersApi.request()
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [])
+    }, [setAuthRateLimitError, isOpenSource])
 
     useEffect(() => {
         // Parse the "user" query parameter from the URL
@@ -112,7 +118,7 @@ const SignInPage = () => {
         if (loginApi.data) {
             setLoading(false)
             store.dispatch(loginSuccess(loginApi.data))
-            navigate(location.state?.path || '/chatflows')
+            navigate(location.state?.path || '/')
             //navigate(0)
         }
 
@@ -122,7 +128,7 @@ const SignInPage = () => {
     useEffect(() => {
         if (ssoLoginApi.data) {
             store.dispatch(loginSuccess(ssoLoginApi.data))
-            navigate(location.state?.path || '/chatflows')
+            navigate(location.state?.path || '/')
         }
 
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -179,6 +185,11 @@ const SignInPage = () => {
                             {successMessage}
                         </Alert>
                     )}
+                    {authRateLimitError && (
+                        <Alert icon={<IconExclamationCircle />} variant='filled' severity='error'>
+                            {authRateLimitError}
+                        </Alert>
+                    )}
                     {authError && (
                         <Alert icon={<IconExclamationCircle />} variant='filled' severity='error'>
                             {authError}
@@ -195,11 +206,7 @@ const SignInPage = () => {
                         <Typography variant='h1'>Sign In</Typography>
                         {isCloud && (
                             <Typography variant='body2' sx={{ color: theme.palette.grey[600] }}>
-                                Don&apos;t have an account?{' '}
-                                <Link style={{ color: `${theme.palette.primary.main}` }} to='/register'>
-                                    Sign up for free
-                                </Link>
-                                .
+                                New sign-ups are currently closed.
                             </Typography>
                         )}
                         {isEnterpriseLicensed && (
@@ -241,18 +248,6 @@ const SignInPage = () => {
                                         Forgot password?
                                     </Link>
                                 </Typography>
-                                {isCloud && (
-                                    <Typography variant='body2' sx={{ color: theme.palette.grey[600], mt: 1, textAlign: 'right' }}>
-                                        <a
-                                            href='https://docs.flowiseai.com/migration-guide/cloud-migration'
-                                            target='_blank'
-                                            rel='noopener noreferrer'
-                                            style={{ color: theme.palette.primary.main }}
-                                        >
-                                            Migrate from existing account?
-                                        </a>
-                                    </Typography>
-                                )}
                             </Box>
                             <LoadingButton
                                 loading={loading}

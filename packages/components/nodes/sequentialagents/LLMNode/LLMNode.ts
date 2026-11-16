@@ -1,6 +1,6 @@
 import { difference, flatten, uniq } from 'lodash'
 import { DataSource } from 'typeorm'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { RunnableSequence, RunnablePassthrough, RunnableConfig } from '@langchain/core/runnables'
 import { ChatPromptTemplate, MessagesPlaceholder, HumanMessagePromptTemplate, BaseMessagePromptTemplateLike } from '@langchain/core/prompts'
 import { BaseChatModel } from '@langchain/core/language_models/chat_models'
@@ -513,7 +513,9 @@ async function createAgent(
             const structuredOutput = z.object(convertStructuredSchemaToZod(llmStructuredOutput))
 
             // @ts-ignore
-            llm = llm.withStructuredOutput(structuredOutput)
+            llm = llm.withStructuredOutput(structuredOutput, {
+                method: 'functionCalling'
+            })
         } catch (exception) {
             console.error(exception)
         }
@@ -712,9 +714,7 @@ const getReturnOutput = async (nodeData: INodeData, input: string, options: ICom
         const sandbox = createCodeExecutionSandbox(input, variables, flow)
 
         try {
-            const response = await executeJavaScriptCode(updateStateMemoryCode, sandbox, {
-                timeout: 10000
-            })
+            const response = await executeJavaScriptCode(updateStateMemoryCode, sandbox)
 
             if (typeof response !== 'object') throw new Error('Return output must be an object')
             return response

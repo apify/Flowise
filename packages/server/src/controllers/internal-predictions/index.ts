@@ -1,12 +1,22 @@
-import { Request, Response, NextFunction } from 'express'
-import { utilBuildChatflow } from '../../utils/buildChatflow'
-import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
+import { NextFunction, Request, Response } from 'express'
+import { StatusCodes } from 'http-status-codes'
+import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { getErrorMessage } from '../../errors/utils'
 import { MODE } from '../../Interface'
+import chatflowService from '../../services/chatflows'
+import { utilBuildChatflow } from '../../utils/buildChatflow'
+import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
 
 // Send input message and get prediction result (Internal)
 const createInternalPrediction = async (req: Request, res: Response, next: NextFunction) => {
     try {
+        const workspaceId = req.user?.activeWorkspaceId
+
+        const chatflow = await chatflowService.getChatflowByIdForWorkspace(req.params.id, workspaceId)
+        if (!chatflow) {
+            throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Chatflow ${req.params.id} not found`)
+        }
+
         if (req.body.streaming || req.body.streaming === 'true') {
             createAndStreamInternalPrediction(req, res, next)
             return
@@ -23,6 +33,7 @@ const createInternalPrediction = async (req: Request, res: Response, next: NextF
 const createAndStreamInternalPrediction = async (req: Request, res: Response, next: NextFunction) => {
     const chatId = req.body.chatId
     const sseStreamer = getRunningExpressApp().sseStreamer
+    const isQueueMode = process.env.MODE === MODE.QUEUE
 
     try {
         sseStreamer.addClient(chatId, res)
@@ -32,8 +43,8 @@ const createAndStreamInternalPrediction = async (req: Request, res: Response, ne
         res.setHeader('X-Accel-Buffering', 'no') //nginx config: https://serverfault.com/a/801629
         res.flushHeaders()
 
-        if (process.env.MODE === MODE.QUEUE) {
-            getRunningExpressApp().redisSubscriber.subscribe(chatId)
+        if (isQueueMode) {
+            await getRunningExpressApp().redisSubscriber.subscribe(chatId)
         }
 
         const apiResponse = await utilBuildChatflow(req, true)
@@ -44,6 +55,9 @@ const createAndStreamInternalPrediction = async (req: Request, res: Response, ne
         }
         next(error)
     } finally {
+        if (isQueueMode && chatId) {
+            await getRunningExpressApp().redisSubscriber.unsubscribe(chatId)
+        }
         sseStreamer.removeClient(chatId)
     }
 }

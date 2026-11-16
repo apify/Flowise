@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:24-alpine
 
 RUN apk add --update libc6-compat python3 make g++
 # needed for pdfjs-dist
@@ -7,8 +7,8 @@ RUN apk add --no-cache build-base cairo-dev pango-dev
 # Install Chromium and curl for container-level health checks
 RUN apk add --no-cache chromium curl
 
-#install PNPM globaly
-RUN npm install -g pnpm
+#install PNPM globally
+RUN npm install -g pnpm@10.26.0
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
@@ -44,6 +44,12 @@ ENV WORKER_PORT=5566
 
 # Expose port (can be overridden by env var)
 EXPOSE ${WORKER_PORT}
+
+# Give the node user ownership of the application files (node:*-alpine already has this user)
+RUN chown -R node:node /usr/src /app
+
+# Switch to non-root user
+USER node
 
 # Start healthcheck in background and flowise worker in foreground
 CMD ["/bin/sh", "-c", "node /app/healthcheck/healthcheck.js & sleep 5 && pnpm run start-worker"]

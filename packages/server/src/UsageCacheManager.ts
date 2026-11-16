@@ -4,6 +4,8 @@ import { Cache, createCache } from 'cache-manager'
 import { MODE } from './Interface'
 import { LICENSE_QUOTAS } from './utils/constants'
 import { StripeManager } from './StripeManager'
+import { InternalFlowiseError } from './errors/internalFlowiseError'
+import { StatusCodes } from 'http-status-codes'
 
 const DISABLED_QUOTAS = {
     [LICENSE_QUOTAS.PREDICTIONS_LIMIT]: 0,
@@ -37,7 +39,19 @@ export class UsageCacheManager {
         if (process.env.MODE === MODE.QUEUE) {
             let redisConfig: string | Record<string, any>
             if (process.env.REDIS_URL) {
-                redisConfig = process.env.REDIS_URL
+                redisConfig = {
+                    url: process.env.REDIS_URL,
+                    socket: {
+                        keepAlive:
+                            process.env.REDIS_KEEP_ALIVE && !isNaN(parseInt(process.env.REDIS_KEEP_ALIVE, 10))
+                                ? parseInt(process.env.REDIS_KEEP_ALIVE, 10)
+                                : undefined
+                    },
+                    pingInterval:
+                        process.env.REDIS_KEEP_ALIVE && !isNaN(parseInt(process.env.REDIS_KEEP_ALIVE, 10))
+                            ? parseInt(process.env.REDIS_KEEP_ALIVE, 10)
+                            : undefined
+                }
             } else {
                 redisConfig = {
                     username: process.env.REDIS_USERNAME || undefined,
@@ -48,8 +62,16 @@ export class UsageCacheManager {
                         tls: process.env.REDIS_TLS === 'true',
                         cert: process.env.REDIS_CERT ? Buffer.from(process.env.REDIS_CERT, 'base64') : undefined,
                         key: process.env.REDIS_KEY ? Buffer.from(process.env.REDIS_KEY, 'base64') : undefined,
-                        ca: process.env.REDIS_CA ? Buffer.from(process.env.REDIS_CA, 'base64') : undefined
-                    }
+                        ca: process.env.REDIS_CA ? Buffer.from(process.env.REDIS_CA, 'base64') : undefined,
+                        keepAlive:
+                            process.env.REDIS_KEEP_ALIVE && !isNaN(parseInt(process.env.REDIS_KEEP_ALIVE, 10))
+                                ? parseInt(process.env.REDIS_KEEP_ALIVE, 10)
+                                : undefined
+                    },
+                    pingInterval:
+                        process.env.REDIS_KEEP_ALIVE && !isNaN(parseInt(process.env.REDIS_KEEP_ALIVE, 10))
+                            ? parseInt(process.env.REDIS_KEEP_ALIVE, 10)
+                            : undefined
                 }
             }
             this.cache = createCache({
@@ -80,6 +102,7 @@ export class UsageCacheManager {
 
         // If not in cache, retrieve from Stripe
         const subscription = await stripeManager.getStripe().subscriptions.retrieve(subscriptionId)
+        if (subscription.status === 'canceled') throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, 'Subscription is canceled')
 
         // Update subscription data cache
         await this.updateSubscriptionDataToCache(subscriptionId, { subsriptionDetails: stripeManager.getSubscriptionObject(subscription) })
@@ -103,6 +126,7 @@ export class UsageCacheManager {
 
         // If not in cache, retrieve from Stripe
         const subscription = await stripeManager.getStripe().subscriptions.retrieve(subscriptionId)
+        if (subscription.status === 'canceled') throw new InternalFlowiseError(StatusCodes.UNAUTHORIZED, 'Subscription is canceled')
         const items = subscription.items.data
         if (items.length === 0) {
             return DISABLED_QUOTAS

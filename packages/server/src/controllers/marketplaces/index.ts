@@ -1,7 +1,8 @@
-import { Request, Response, NextFunction } from 'express'
-import marketplacesService from '../../services/marketplaces'
-import { InternalFlowiseError } from '../../errors/internalFlowiseError'
+import { NextFunction, Request, Response } from 'express'
 import { StatusCodes } from 'http-status-codes'
+import { InternalFlowiseError } from '../../errors/internalFlowiseError'
+import marketplacesService from '../../services/marketplaces'
+import { stripProtectedFields } from '../../utils/stripProtectedFields'
 
 // Get all templates for marketplaces
 const getAllTemplates = async (req: Request, res: Response, next: NextFunction) => {
@@ -21,7 +22,14 @@ const deleteCustomTemplate = async (req: Request, res: Response, next: NextFunct
                 `Error: marketplacesService.deleteCustomTemplate - id not provided!`
             )
         }
-        const apiResponse = await marketplacesService.deleteCustomTemplate(req.params.id)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: marketplacesController.deleteCustomTemplate - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await marketplacesService.deleteCustomTemplate(req.params.id, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -45,9 +53,14 @@ const saveCustomTemplate = async (req: Request, res: Response, next: NextFunctio
                 `Error: marketplacesService.saveCustomTemplate - body not provided!`
             )
         }
-        const body = req.body
-        body.workspaceId = req.user?.activeWorkspaceId
-        const apiResponse = await marketplacesService.saveCustomTemplate(body)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: marketplacesController.saveCustomTemplate - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await marketplacesService.saveCustomTemplate({ ...stripProtectedFields(req.body), workspaceId })
         return res.json(apiResponse)
     } catch (error) {
         next(error)

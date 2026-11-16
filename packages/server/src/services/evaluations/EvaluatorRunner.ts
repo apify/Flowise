@@ -14,8 +14,14 @@ export const runAdditionalEvaluators = async (
     metricsArray: ICommonObject[],
     actualOutputArray: string[],
     errorArray: string[],
-    selectedEvaluators: string[]
+    selectedEvaluators: string[],
+    workspaceId: string
 ) => {
+    // Validate that inputs are arrays
+    if (!Array.isArray(actualOutputArray) || !Array.isArray(selectedEvaluators)) {
+        throw new Error('Invalid input: expected arrays')
+    }
+
     const evaluationResults: any[] = []
     const evaluatorDict: any = {}
 
@@ -27,7 +33,7 @@ export const runAdditionalEvaluators = async (
             const evaluatorId = selectedEvaluators[i]
             let evaluator = evaluatorDict[evaluatorId]
             if (!evaluator) {
-                evaluator = await evaluatorsService.getEvaluator(evaluatorId)
+                evaluator = await evaluatorsService.getEvaluator(evaluatorId, workspaceId)
                 evaluatorDict[evaluatorId] = evaluator
             }
 
@@ -101,7 +107,10 @@ export const runAdditionalEvaluators = async (
                             break
                         case 'ContainsAny':
                             passed = false
-                            splitValues = value.split(',').map((v) => v.trim().toLowerCase()) // Split, trim, and convert to lowercase
+                            splitValues = value
+                                .split(',')
+                                .map((v) => v.trim())
+                                .filter(Boolean)
                             for (let i = 0; i < splitValues.length; i++) {
                                 if (actualOutput.includes(splitValues[i])) {
                                     passed = true
@@ -115,7 +124,10 @@ export const runAdditionalEvaluators = async (
                             break
                         case 'ContainsAll':
                             passed = true
-                            splitValues = value.split(',').map((v) => v.trim().toLowerCase()) // Split, trim, and convert to lowercase
+                            splitValues = value
+                                .split(',')
+                                .map((v) => v.trim())
+                                .filter(Boolean)
                             for (let i = 0; i < splitValues.length; i++) {
                                 if (!actualOutput.includes(splitValues[i])) {
                                     passed = false
@@ -129,21 +141,10 @@ export const runAdditionalEvaluators = async (
                             break
                         case 'DoesNotContainAny':
                             passed = true
-                            splitValues = value.split(',').map((v) => v.trim().toLowerCase()) // Split, trim, and convert to lowercase
-                            for (let i = 0; i < splitValues.length; i++) {
-                                if (actualOutput.includes(splitValues[i])) {
-                                    passed = false
-                                    break
-                                }
-                            }
-                            subArray.push({
-                                ...returnFields,
-                                result: passed ? 'Fail' : 'Pass'
-                            })
-                            break
-                        case 'DoesNotContainAll':
-                            passed = true
-                            splitValues = value.split(',').map((v) => v.trim().toLowerCase()) // Split, trim, and convert to lowercase
+                            splitValues = value
+                                .split(',')
+                                .map((v) => v.trim())
+                                .filter(Boolean)
                             for (let i = 0; i < splitValues.length; i++) {
                                 if (actualOutput.includes(splitValues[i])) {
                                     passed = false
@@ -153,6 +154,23 @@ export const runAdditionalEvaluators = async (
                             subArray.push({
                                 ...returnFields,
                                 result: passed ? 'Pass' : 'Fail'
+                            })
+                            break
+                        case 'DoesNotContainAll':
+                            passed = true
+                            splitValues = value
+                                .split(',')
+                                .map((v) => v.trim())
+                                .filter(Boolean)
+                            for (let i = 0; i < splitValues.length; i++) {
+                                if (!actualOutput.includes(splitValues[i])) {
+                                    passed = false
+                                    break
+                                }
+                            }
+                            subArray.push({
+                                ...returnFields,
+                                result: passed ? 'Fail' : 'Pass'
                             })
                             break
                     }

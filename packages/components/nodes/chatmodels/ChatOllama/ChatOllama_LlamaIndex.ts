@@ -1,6 +1,7 @@
 import { INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getBaseClasses } from '../../../src/utils'
 import { OllamaParams, Ollama } from 'llamaindex'
+import { checkDenyList } from '../../../src/httpSecurity'
 
 class ChatOllama_LlamaIndex_ChatModels implements INode {
     label: string
@@ -13,6 +14,8 @@ class ChatOllama_LlamaIndex_ChatModels implements INode {
     tags: string[]
     baseClasses: string[]
     inputs: INodeParams[]
+    badge: string
+    deprecateMessage: string
 
     constructor() {
         this.label = 'ChatOllama'
@@ -24,6 +27,8 @@ class ChatOllama_LlamaIndex_ChatModels implements INode {
         this.description = 'Wrapper around ChatOllama LLM specific for LlamaIndex'
         this.baseClasses = [this.type, 'BaseChatModel_LlamaIndex', ...getBaseClasses(Ollama)]
         this.tags = ['LlamaIndex']
+        this.badge = 'DEPRECATING'
+        this.deprecateMessage = 'LlamaIndex integration is deprecated and will be removed in a future release.'
         this.inputs = [
             {
                 label: 'Base URL',
@@ -187,6 +192,8 @@ class ChatOllama_LlamaIndex_ChatModels implements INode {
         const repeatPenalty = nodeData.inputs?.repeatPenalty as string
         const stop = nodeData.inputs?.stop as string
         const tfsZ = nodeData.inputs?.tfsZ as string
+
+        if (baseUrl) await checkDenyList(baseUrl)
 
         const obj: OllamaParams = {
             model: modelName,

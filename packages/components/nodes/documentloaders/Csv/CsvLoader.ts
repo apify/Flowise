@@ -1,8 +1,8 @@
-import { TextLoader } from 'langchain/document_loaders/fs/text'
+import { TextLoader } from '@langchain/classic/document_loaders/fs/text'
 import Papa from 'papaparse'
 
 type CSVLoaderOptions = {
-    // Return specifific column from key (string) or index (integer)
+    // Return specific column from key (string) or index (integer)
     column?: string | number
     // Force separator (default: auto detect)
     separator?: string

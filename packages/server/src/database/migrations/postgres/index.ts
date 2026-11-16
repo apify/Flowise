@@ -36,8 +36,17 @@ import { AddExecutionEntity1738090872625 } from './1738090872625-AddExecutionEnt
 import { FixOpenSourceAssistantTable1743758056188 } from './1743758056188-FixOpenSourceAssistantTable'
 import { AddErrorToEvaluationRun1744964560174 } from './1744964560174-AddErrorToEvaluationRun'
 import { ModifyExecutionSessionIdFieldType1748450230238 } from './1748450230238-ModifyExecutionSessionIdFieldType'
+import { AddTextToSpeechToChatFlow1754986480347 } from './1754986480347-AddTextToSpeechToChatFlow'
 import { ModifyChatflowType1755066758601 } from './1755066758601-ModifyChatflowType'
-import { AddChatFlowNameIndex1755748356008 } from './1755748356008-AddChatFlowNameIndex'
+import { AddTextToSpeechToChatFlow1759419194331 } from './1759419194331-AddTextToSpeechToChatFlow'
+import { AddChatFlowNameIndex1759424903973 } from './1759424903973-AddChatFlowNameIndex'
+import { AddApiKeyPermission1765360298674 } from './1765360298674-AddApiKeyPermission'
+import { AddReasonContentToChatMessage1764759496768 } from './1764759496768-AddReasonContentToChatMessage'
+import { AddWebhookSecretToChatFlow1776240000001 } from './1776240000001-AddWebhookSecretToChatFlow'
+import { AddCustomMcpServer1766000000000 } from './1766000000000-AddCustomMcpServer'
+import { AddMcpServerConfigToChatFlow1767000000000 } from './1767000000000-AddMcpServerConfigToChatFlow'
+import { AddScheduleEntities1772000000000 } from './1772000000000-AddScheduleEntities'
+import { AddSSOIdentityBinding1780000000000 } from '../../../enterprise/database/migrations/postgres/1780000000000-AddSSOIdentityBinding'
 
 import { AddAuthTables1720230151482 } from '../../../enterprise/database/migrations/postgres/1720230151482-AddAuthTables'
 import { AddWorkspace1720230151484 } from '../../../enterprise/database/migrations/postgres/1720230151484-AddWorkspace'
@@ -101,6 +110,15 @@ export const postgresMigrations = [
     AddErrorToEvaluationRun1744964560174,
     ExecutionLinkWorkspaceId1746862866554,
     ModifyExecutionSessionIdFieldType1748450230238,
+    AddTextToSpeechToChatFlow1754986480347,
     ModifyChatflowType1755066758601,
-    AddChatFlowNameIndex1755748356008
+    AddTextToSpeechToChatFlow1759419194331,
+    AddChatFlowNameIndex1759424903973,
+    AddApiKeyPermission1765360298674,
+    AddReasonContentToChatMessage1764759496768,
+    AddWebhookSecretToChatFlow1776240000001,
+    AddCustomMcpServer1766000000000,
+    AddMcpServerConfigToChatFlow1767000000000,
+    AddScheduleEntities1772000000000,
+    AddSSOIdentityBinding1780000000000
 ]

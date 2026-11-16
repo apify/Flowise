@@ -1,16 +1,17 @@
-import path from 'path'
 import * as fs from 'fs'
 import { StatusCodes } from 'http-status-codes'
+import path from 'path'
+import { DeleteResult } from 'typeorm'
+import { v4 as uuidv4 } from 'uuid'
+import { CustomTemplate } from '../../database/entities/CustomTemplate'
+import { WorkspaceService } from '../../enterprise/services/workspace.service'
+import { getWorkspaceSearchOptions } from '../../enterprise/utils/ControllerServiceUtils'
 import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { getErrorMessage } from '../../errors/utils'
 import { IReactFlowEdge, IReactFlowNode } from '../../Interface'
 import { getRunningExpressApp } from '../../utils/getRunningExpressApp'
-import { DeleteResult } from 'typeorm'
-import { CustomTemplate } from '../../database/entities/CustomTemplate'
-import { v4 as uuidv4 } from 'uuid'
+import { stripProtectedFields } from '../../utils/stripProtectedFields'
 import chatflowsService from '../chatflows'
-import { getWorkspaceSearchOptions } from '../../enterprise/utils/ControllerServiceUtils'
-import { WorkspaceService } from '../../enterprise/services/workspace.service'
 
 type ITemplate = {
     badge: string
@@ -138,10 +139,10 @@ const getAllTemplates = async () => {
     }
 }
 
-const deleteCustomTemplate = async (templateId: string): Promise<DeleteResult> => {
+const deleteCustomTemplate = async (templateId: string, workspaceId: string): Promise<DeleteResult> => {
     try {
         const appServer = getRunningExpressApp()
-        return await appServer.AppDataSource.getRepository(CustomTemplate).delete({ id: templateId })
+        return await appServer.AppDataSource.getRepository(CustomTemplate).delete({ id: templateId, workspaceId: workspaceId })
     } catch (error) {
         throw new InternalFlowiseError(
             StatusCodes.INTERNAL_SERVER_ERROR,
@@ -208,10 +209,11 @@ const saveCustomTemplate = async (body: any): Promise<any> => {
         let flowDataStr = ''
         let derivedFramework = ''
         const customTemplate = new CustomTemplate()
-        Object.assign(customTemplate, body)
+        Object.assign(customTemplate, stripProtectedFields(body))
+        customTemplate.workspaceId = body.workspaceId // re-apply: set by controller from req.user
 
         if (body.chatflowId) {
-            const chatflow = await chatflowsService.getChatflowById(body.chatflowId)
+            const chatflow = await chatflowsService.getChatflowById(body.chatflowId, body.workspaceId)
             const flowData = JSON.parse(chatflow.flowData)
             const { framework, exportJson } = _generateExportFlowData(flowData)
             flowDataStr = JSON.stringify(exportJson)

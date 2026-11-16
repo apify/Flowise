@@ -1,8 +1,8 @@
 import { Document } from '@langchain/core/documents'
-import axios, { AxiosRequestConfig } from 'axios'
-import * as https from 'https'
-import { BaseDocumentLoader } from 'langchain/document_loaders/base'
-import { TextSplitter } from 'langchain/text_splitter'
+import { AxiosRequestConfig } from 'axios'
+import { secureAxiosRequest } from '../../../src/httpSecurity'
+import { BaseDocumentLoader } from '@langchain/classic/document_loaders/base'
+import { TextSplitter } from '@langchain/textsplitters'
 import { omit } from 'lodash'
 import { getFileFromStorage } from '../../../src'
 import { ICommonObject, IDocument, INode, INodeData, INodeOutputsValue, INodeParams } from '../../../src/Interface'
@@ -95,7 +95,7 @@ class API_DocumentLoaders implements INode {
                 type: 'string',
                 rows: 4,
                 description:
-                    'Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, seperated by comma. Use * to omit all metadata keys execept the ones you specify in the Additional Metadata field',
+                    'Each document loader comes with a default set of metadata keys that are extracted from the document. You can use this field to omit some of the default metadata keys. The value should be a list of keys, separated by comma. Use * to omit all metadata keys except the ones you specify in the Additional Metadata field',
                 placeholder: 'key1, key2, key3.nestedKey1',
                 optional: true,
                 additionalParams: true
@@ -256,16 +256,9 @@ class ApiLoader extends BaseDocumentLoader {
 
     protected async executeGetRequest(url: string, headers?: ICommonObject, ca?: string): Promise<IDocument[]> {
         try {
-            const config: AxiosRequestConfig = {}
-            if (headers) {
-                config.headers = headers
-            }
-            if (ca) {
-                config.httpsAgent = new https.Agent({
-                    ca: ca
-                })
-            }
-            const response = await axios.get(url, config)
+            const config: AxiosRequestConfig = { method: 'GET', url, headers: headers ?? {} }
+            const agentOptions = ca ? { ca } : undefined
+            const response = await secureAxiosRequest(config, 5, agentOptions)
             const responseJsonString = JSON.stringify(response.data, null, 2)
             const doc = new Document({
                 pageContent: responseJsonString,
@@ -281,16 +274,9 @@ class ApiLoader extends BaseDocumentLoader {
 
     protected async executePostRequest(url: string, headers?: ICommonObject, body?: ICommonObject, ca?: string): Promise<IDocument[]> {
         try {
-            const config: AxiosRequestConfig = {}
-            if (headers) {
-                config.headers = headers
-            }
-            if (ca) {
-                config.httpsAgent = new https.Agent({
-                    ca: ca
-                })
-            }
-            const response = await axios.post(url, body ?? {}, config)
+            const config: AxiosRequestConfig = { method: 'POST', url, data: body ?? {}, headers: headers ?? {} }
+            const agentOptions = ca ? { ca } : undefined
+            const response = await secureAxiosRequest(config, 5, agentOptions)
             const responseJsonString = JSON.stringify(response.data, null, 2)
             const doc = new Document({
                 pageContent: responseJsonString,

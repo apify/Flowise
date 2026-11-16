@@ -17,6 +17,8 @@ English | [繁體中文](./i18n/README-TW.md) | [简体中文](./i18n/README-ZH.
 
 </div>
 
+<h2>Flowise has been archived. Refer to [Future of Flowise](https://github.com/FlowiseAI/Flowise/discussions/6727)</h2>
+
 <h3>Build AI Agents, Visually</h3>
 <a href="https://github.com/FlowiseAI/Flowise">
 <img width="100%" src="https://github.com/FlowiseAI/Flowise/blob/main/images/flowise_agentflow.gif?raw=true"></a>
@@ -36,7 +38,7 @@ English | [繁體中文](./i18n/README-TW.md) | [简体中文](./i18n/README-ZH.
 
 ## ⚡Quick Start
 
-Download and Install [NodeJS](https://nodejs.org/en/download) >= 18.15.0
+Download and Install [NodeJS](https://nodejs.org/en/download) >= 20.0.0
 
 1. Install Flowise
     ```bash
@@ -190,11 +192,15 @@ Deploy Flowise self-hosted in your existing infrastructure, we support various [
 
         [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/pn4G8S?referralCode=WVNPD9)
 
+    -   [Northflank](https://northflank.com/stacks/deploy-flowiseai)
+
+        [![Deploy to Northflank](https://assets.northflank.com/deploy_to_northflank_smm_36700fb050.svg)](https://northflank.com/stacks/deploy-flowiseai)
+
     -   [Render](https://docs.flowiseai.com/configuration/deployment/render)
 
         [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://docs.flowiseai.com/configuration/deployment/render)
 
-    -   [HuggingFace Spaces](https://docs.flowiseai.com/deployment/hugging-face)
+    -   [HuggingFace Spaces](https://docs.flowiseai.com/configuration/deployment/hugging-face)
 
         <a href="https://huggingface.co/spaces/FlowiseAI/Flowise"><img src="https://huggingface.co/datasets/huggingface/badges/raw/main/open-in-hf-spaces-sm.svg" alt="HuggingFace Spaces"></a>
 

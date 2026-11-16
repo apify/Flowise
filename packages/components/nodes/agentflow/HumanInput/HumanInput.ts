@@ -12,6 +12,7 @@ import {
 } from '../../../src/Interface'
 import { AIMessageChunk, BaseMessageLike } from '@langchain/core/messages'
 import { DEFAULT_HUMAN_INPUT_DESCRIPTION, DEFAULT_HUMAN_INPUT_DESCRIPTION_HTML } from '../prompt'
+import { extractResponseContent } from '../../../src/utils'
 
 class HumanInput_Agentflow implements INode {
     label: string
@@ -186,7 +187,7 @@ class HumanInput_Agentflow implements INode {
                 }
             ]
             const input = { ...humanInput, messages }
-            const output = { conditions: outcomes }
+            const output = { content: humanInput.feedback || humanInput.type, conditions: outcomes }
 
             const nodeOutput = {
                 id: nodeData.id,
@@ -241,13 +242,16 @@ class HumanInput_Agentflow implements INode {
                     if (isStreamable) {
                         const sseStreamer: IServerSideEventStreamer = options.sseStreamer as IServerSideEventStreamer
                         for await (const chunk of await llmNodeInstance.stream(messages)) {
-                            sseStreamer.streamTokenEvent(chatId, chunk.content.toString())
-                            response = response.concat(chunk)
+                            const content = typeof chunk === 'string' ? chunk : chunk.content.toString()
+                            sseStreamer.streamTokenEvent(chatId, content)
+
+                            const messageChunk = typeof chunk === 'string' ? new AIMessageChunk(chunk) : chunk
+                            response = response.concat(messageChunk)
                         }
                         humanInputDescription = response.content as string
                     } else {
                         const response = await llmNodeInstance.invoke(messages)
-                        humanInputDescription = response.content as string
+                        humanInputDescription = extractResponseContent(response)
                     }
                 }
             }

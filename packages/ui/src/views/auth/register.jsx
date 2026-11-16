@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 
 // material-ui
 import { Alert, Box, Button, Divider, Icon, List, ListItemText, OutlinedInput, Stack, Typography, useTheme } from '@mui/material'
@@ -18,6 +18,7 @@ import ssoApi from '@/api/sso'
 // Hooks
 import useApi from '@/hooks/useApi'
 import { useConfig } from '@/store/context/ConfigContext'
+import { useError } from '@/store/context/ErrorContext'
 
 // utils
 import useNotifier from '@/utils/useNotifier'
@@ -111,7 +112,9 @@ const RegisterPage = () => {
 
     const [loading, setLoading] = useState(false)
     const [authError, setAuthError] = useState('')
-    const [successMsg, setSuccessMsg] = useState(undefined)
+    const [successMsg, setSuccessMsg] = useState('')
+
+    const { authRateLimitError, setAuthRateLimitError } = useError()
 
     const registerApi = useApi(accountApi.registerAccount)
     const ssoLoginApi = useApi(ssoApi.ssoLogin)
@@ -120,6 +123,7 @@ const RegisterPage = () => {
 
     const register = async (event) => {
         event.preventDefault()
+        setAuthRateLimitError(null)
         if (isEnterpriseLicensed) {
             const result = RegisterEnterpriseUserSchema.safeParse({
                 username,
@@ -184,7 +188,7 @@ const RegisterPage = () => {
                     `Error in registering user. Please contact your administrator. (${registerApi.error?.response?.data?.message})`
                 )
             } else if (isCloud) {
-                setAuthError(`Error in registering user. Please try again.`)
+                setAuthError(registerApi.error?.response?.data?.message || 'Error in registering user. Please try again.')
             }
             setLoading(false)
         }
@@ -192,6 +196,7 @@ const RegisterPage = () => {
     }, [registerApi.error])
 
     useEffect(() => {
+        setAuthRateLimitError(null)
         if (!isOpenSource) {
             getDefaultProvidersApi.request()
         }
@@ -201,7 +206,7 @@ const RegisterPage = () => {
     useEffect(() => {
         if (ssoLoginApi.data) {
             store.dispatch(loginSuccess(ssoLoginApi.data))
-            navigate(location.state?.path || '/chatflows')
+            navigate(location.state?.path || '/')
         }
 
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -272,6 +277,11 @@ const RegisterPage = () => {
                             ) : (
                                 authError
                             )}
+                        </Alert>
+                    )}
+                    {authRateLimitError && (
+                        <Alert icon={<IconExclamationCircle />} variant='filled' severity='error'>
+                            {authRateLimitError}
                         </Alert>
                     )}
                     {successMsg && (

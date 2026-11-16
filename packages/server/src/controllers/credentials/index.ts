@@ -28,7 +28,14 @@ const deleteCredentials = async (req: Request, res: Response, next: NextFunction
                 `Error: credentialsController.deleteCredentials - id not provided!`
             )
         }
-        const apiResponse = await credentialsService.deleteCredentials(req.params.id)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: credentialsController.deleteCredentials - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await credentialsService.deleteCredentials(req.params.id, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -37,7 +44,14 @@ const deleteCredentials = async (req: Request, res: Response, next: NextFunction
 
 const getAllCredentials = async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const apiResponse = await credentialsService.getAllCredentials(req.query.credentialName, req.user?.activeWorkspaceId)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: credentialsController.getAllCredentials - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await credentialsService.getAllCredentials(req.query.credentialName, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -52,7 +66,36 @@ const getCredentialById = async (req: Request, res: Response, next: NextFunction
                 `Error: credentialsController.getCredentialById - id not provided!`
             )
         }
-        const apiResponse = await credentialsService.getCredentialById(req.params.id, req.user?.activeWorkspaceId)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: credentialsController.getCredentialById - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await credentialsService.getCredentialById(req.params.id, workspaceId)
+        return res.json(apiResponse)
+    } catch (error) {
+        next(error)
+    }
+}
+
+const revealCredentialById = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        if (typeof req.params === 'undefined' || !req.params.id) {
+            throw new InternalFlowiseError(
+                StatusCodes.PRECONDITION_FAILED,
+                `Error: credentialsController.revealCredentialById - id not provided!`
+            )
+        }
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: credentialsController.revealCredentialById - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await credentialsService.revealCredentialById(req.params.id, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -73,7 +116,14 @@ const updateCredential = async (req: Request, res: Response, next: NextFunction)
                 `Error: credentialsController.updateCredential - body not provided!`
             )
         }
-        const apiResponse = await credentialsService.updateCredential(req.params.id, req.body)
+        const workspaceId = req.user?.activeWorkspaceId
+        if (!workspaceId) {
+            throw new InternalFlowiseError(
+                StatusCodes.NOT_FOUND,
+                `Error: credentialsController.updateCredential - workspace ${workspaceId} not found!`
+            )
+        }
+        const apiResponse = await credentialsService.updateCredential(req.params.id, req.body, workspaceId)
         return res.json(apiResponse)
     } catch (error) {
         next(error)
@@ -85,5 +135,6 @@ export default {
     deleteCredentials,
     getAllCredentials,
     getCredentialById,
+    revealCredentialById,
     updateCredential
 }

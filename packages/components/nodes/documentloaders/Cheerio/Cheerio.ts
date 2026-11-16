@@ -1,11 +1,12 @@
-import { TextSplitter } from 'langchain/text_splitter'
+import { TextSplitter } from '@langchain/textsplitters'
 import { omit } from 'lodash'
-import { CheerioWebBaseLoader, WebBaseLoaderParams } from '@langchain/community/document_loaders/web/cheerio'
+import { CheerioWebBaseLoader, CheerioWebBaseLoaderParams } from '@langchain/community/document_loaders/web/cheerio'
 import { test } from 'linkifyjs'
 import { parse } from 'css-what'
 import { SelectorType } from 'cheerio'
 import { ICommonObject, INodeOutputsValue, IDocument, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { handleEscapeCharacters, webCrawl, xmlScrape } from '../../../src/utils'
+import { checkDenyList, secureFetch } from '../../../src/httpSecurity'
 
 class Cheerio_DocumentLoaders implements INode {
     label: string
@@ -140,7 +141,7 @@ class Cheerio_DocumentLoaders implements INode {
 
         const selector: SelectorType = nodeData.inputs?.selector as SelectorType
 
-        let params: WebBaseLoaderParams = {}
+        let params: CheerioWebBaseLoaderParams = {}
         if (selector) {
             parse(selector) // comes with cheerio - will throw error if invalid
             params['selector'] = selector
@@ -148,6 +149,7 @@ class Cheerio_DocumentLoaders implements INode {
 
         async function cheerioLoader(url: string): Promise<any> {
             try {
+                await checkDenyList(url)
                 let docs: IDocument[] = []
                 if (url.endsWith('.pdf')) {
                     if (process.env.DEBUG === 'true')
@@ -155,6 +157,15 @@ class Cheerio_DocumentLoaders implements INode {
                     return docs
                 }
                 const loader = new CheerioWebBaseLoader(url, params)
+                loader.scrape = async () => {
+                    const { load } = await CheerioWebBaseLoader.imports()
+                    const response = await secureFetch(url, {
+                        signal: loader.timeout ? AbortSignal.timeout(loader.timeout) : undefined,
+                        headers: loader.headers
+                    } as any)
+                    const html = loader.textDecoder?.decode(await response.arrayBuffer()) ?? (await response.text())
+                    return load(html)
+                }
                 if (textSplitter) {
                     docs = await loader.load()
                     docs = await textSplitter.splitDocuments(docs)

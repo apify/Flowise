@@ -1,4 +1,5 @@
-import { ICommonObject } from 'flowise-components'
+import { stripProtectedFields } from '../../utils/stripProtectedFields'
+import { extractResponseContent, ICommonObject } from 'flowise-components'
 import { StatusCodes } from 'http-status-codes'
 import { cloneDeep, isEqual, uniqWith } from 'lodash'
 import OpenAI from 'openai'
@@ -20,7 +21,7 @@ import { ASSISTANT_PROMPT_GENERATOR } from '../../utils/prompt'
 import { checkUsageLimit } from '../../utils/quotaUsage'
 import nodesService from '../nodes'
 
-const createAssistant = async (requestBody: any, orgId: string): Promise<Assistant> => {
+const createAssistant = async (requestBody: any, orgId: string, workspaceId: string): Promise<Assistant> => {
     try {
         const appServer = getRunningExpressApp()
         if (!requestBody.details) {
@@ -29,8 +30,11 @@ const createAssistant = async (requestBody: any, orgId: string): Promise<Assista
         const assistantDetails = JSON.parse(requestBody.details)
 
         if (requestBody.type === 'CUSTOM') {
+            // For CUSTOM assistants the credential field is a client-generated UUID used as an
+            // internal identifier, not a reference to the Credential entity, so no lookup is needed.
             const newAssistant = new Assistant()
-            Object.assign(newAssistant, requestBody)
+            Object.assign(newAssistant, stripProtectedFields(requestBody))
+            newAssistant.workspaceId = workspaceId
 
             const assistant = appServer.AppDataSource.getRepository(Assistant).create(newAssistant)
             const dbResponse = await appServer.AppDataSource.getRepository(Assistant).save(assistant)
@@ -51,7 +55,8 @@ const createAssistant = async (requestBody: any, orgId: string): Promise<Assista
 
         try {
             const credential = await appServer.AppDataSource.getRepository(Credential).findOneBy({
-                id: requestBody.credential
+                id: requestBody.credential,
+                workspaceId: workspaceId
             })
 
             if (!credential) {
@@ -135,7 +140,8 @@ const createAssistant = async (requestBody: any, orgId: string): Promise<Assista
             throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Error creating new assistant - ${getErrorMessage(error)}`)
         }
         const newAssistant = new Assistant()
-        Object.assign(newAssistant, requestBody)
+        Object.assign(newAssistant, stripProtectedFields(requestBody))
+        newAssistant.workspaceId = workspaceId
 
         const assistant = appServer.AppDataSource.getRepository(Assistant).create(newAssistant)
         const dbResponse = await appServer.AppDataSource.getRepository(Assistant).save(assistant)
@@ -160,11 +166,12 @@ const createAssistant = async (requestBody: any, orgId: string): Promise<Assista
     }
 }
 
-const deleteAssistant = async (assistantId: string, isDeleteBoth: any): Promise<DeleteResult> => {
+const deleteAssistant = async (assistantId: string, isDeleteBoth: any, workspaceId: string): Promise<DeleteResult> => {
     try {
         const appServer = getRunningExpressApp()
         const assistant = await appServer.AppDataSource.getRepository(Assistant).findOneBy({
-            id: assistantId
+            id: assistantId,
+            workspaceId: workspaceId
         })
         if (!assistant) {
             throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Assistant ${assistantId} not found`)
@@ -176,7 +183,8 @@ const deleteAssistant = async (assistantId: string, isDeleteBoth: any): Promise<
         try {
             const assistantDetails = JSON.parse(assistant.details)
             const credential = await appServer.AppDataSource.getRepository(Credential).findOneBy({
-                id: assistant.credential
+                id: assistant.credential,
+                workspaceId: workspaceId
             })
 
             if (!credential) {
@@ -192,7 +200,7 @@ const deleteAssistant = async (assistantId: string, isDeleteBoth: any): Promise<
 
             const openai = new OpenAI({ apiKey: openAIApiKey })
             const dbResponse = await appServer.AppDataSource.getRepository(Assistant).delete({ id: assistantId })
-            if (isDeleteBoth) await openai.beta.assistants.del(assistantDetails.id)
+            if (isDeleteBoth) await openai.beta.assistants.delete(assistantDetails.id)
             return dbResponse
         } catch (error: any) {
             throw new InternalFlowiseError(StatusCodes.INTERNAL_SERVER_ERROR, `Error deleting assistant - ${getErrorMessage(error)}`)
@@ -225,7 +233,7 @@ async function getAssistantsCountByOrganization(type: AssistantType, organizatio
     }
 }
 
-const getAllAssistants = async (type?: AssistantType, workspaceId?: string): Promise<Assistant[]> => {
+const getAllAssistants = async (workspaceId: string, type?: AssistantType): Promise<Assistant[]> => {
     try {
         const appServer = getRunningExpressApp()
         if (type) {
@@ -245,7 +253,7 @@ const getAllAssistants = async (type?: AssistantType, workspaceId?: string): Pro
     }
 }
 
-const getAllAssistantsCount = async (type?: AssistantType, workspaceId?: string): Promise<number> => {
+const getAllAssistantsCount = async (workspaceId: string, type?: AssistantType): Promise<number> => {
     try {
         const appServer = getRunningExpressApp()
         if (type) {
@@ -265,11 +273,12 @@ const getAllAssistantsCount = async (type?: AssistantType, workspaceId?: string)
     }
 }
 
-const getAssistantById = async (assistantId: string): Promise<Assistant> => {
+const getAssistantById = async (assistantId: string, workspaceId: string): Promise<Assistant> => {
     try {
         const appServer = getRunningExpressApp()
         const dbResponse = await appServer.AppDataSource.getRepository(Assistant).findOneBy({
-            id: assistantId
+            id: assistantId,
+            workspaceId: workspaceId
         })
         if (!dbResponse) {
             throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Assistant ${assistantId} not found`)
@@ -283,23 +292,36 @@ const getAssistantById = async (assistantId: string): Promise<Assistant> => {
     }
 }
 
-const updateAssistant = async (assistantId: string, requestBody: any): Promise<Assistant> => {
+const updateAssistant = async (assistantId: string, requestBody: any, workspaceId: string): Promise<Assistant> => {
     try {
         const appServer = getRunningExpressApp()
         const assistant = await appServer.AppDataSource.getRepository(Assistant).findOneBy({
-            id: assistantId
+            id: assistantId,
+            workspaceId: workspaceId
         })
 
         if (!assistant) {
             throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Assistant ${assistantId} not found`)
         }
 
-        if (assistant.type === 'CUSTOM') {
-            const body = requestBody
-            const updateAssistant = new Assistant()
-            Object.assign(updateAssistant, body)
+        if (requestBody.details !== undefined) {
+            if (!requestBody.details) {
+                throw new InternalFlowiseError(StatusCodes.PRECONDITION_FAILED, `Details cannot be empty`)
+            }
+            let parsedDetails: any
+            try {
+                parsedDetails = JSON.parse(requestBody.details)
+            } catch (e) {
+                throw new InternalFlowiseError(StatusCodes.PRECONDITION_FAILED, `Details must be valid JSON`)
+            }
+            if (assistant.type === 'CUSTOM' && !parsedDetails?.name) {
+                throw new InternalFlowiseError(StatusCodes.PRECONDITION_FAILED, `Details must include a name field`)
+            }
+        }
 
-            appServer.AppDataSource.getRepository(Assistant).merge(assistant, updateAssistant)
+        if (assistant.type === 'CUSTOM') {
+            Object.assign(assistant, stripProtectedFields(requestBody))
+
             const dbResponse = await appServer.AppDataSource.getRepository(Assistant).save(assistant)
             return dbResponse
         }
@@ -309,7 +331,8 @@ const updateAssistant = async (assistantId: string, requestBody: any): Promise<A
             const body = requestBody
             const assistantDetails = JSON.parse(body.details)
             const credential = await appServer.AppDataSource.getRepository(Credential).findOneBy({
-                id: body.credential
+                id: body.credential,
+                workspaceId: workspaceId
             })
 
             if (!credential) {
@@ -373,11 +396,12 @@ const updateAssistant = async (assistantId: string, requestBody: any): Promise<A
             }
             if (savedToolResources) newAssistantDetails.tool_resources = savedToolResources
 
-            const updateAssistant = new Assistant()
-            body.details = JSON.stringify(newAssistantDetails)
-            Object.assign(updateAssistant, body)
+            // Explicit allowlist — mutate only allowed fields on the fetched entity (same
+            // reasoning as the CUSTOM path above: avoid merge() with an intermediate entity).
+            assistant.details = JSON.stringify(newAssistantDetails)
+            if (body.credential !== undefined) assistant.credential = body.credential
+            if (body.iconSrc !== undefined) assistant.iconSrc = body.iconSrc
 
-            appServer.AppDataSource.getRepository(Assistant).merge(assistant, updateAssistant)
             const dbResponse = await appServer.AppDataSource.getRepository(Assistant).save(assistant)
             return dbResponse
         } catch (error) {
@@ -461,7 +485,7 @@ const getChatModels = async (): Promise<any> => {
     }
 }
 
-const getDocumentStores = async (activeWorkspaceId?: string): Promise<any> => {
+const getDocumentStores = async (activeWorkspaceId: string): Promise<any> => {
     try {
         const appServer = getRunningExpressApp()
         const stores = await appServer.AppDataSource.getRepository(DocumentStore).findBy(getWorkspaceSearchOptions(activeWorkspaceId))
@@ -526,8 +550,7 @@ const generateAssistantInstruction = async (task: string, selectedChatModel: ICo
                     content: ASSISTANT_PROMPT_GENERATOR.replace('{{task}}', task)
                 }
             ])
-            const content = response?.content || response.kwargs?.content
-
+            const content = extractResponseContent(response)
             return { content }
         }
 

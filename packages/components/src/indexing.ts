@@ -1,14 +1,37 @@
 import { VectorStore } from '@langchain/core/vectorstores'
 import { v5 as uuidv5 } from 'uuid'
 import { RecordManagerInterface, UUIDV5_NAMESPACE } from '@langchain/community/indexes/base'
-import { insecureHash } from '@langchain/core/utils/hash'
+import { sha256 } from '@langchain/core/utils/hash'
 import { Document, DocumentInterface } from '@langchain/core/documents'
-import { BaseDocumentLoader } from 'langchain/document_loaders/base.js'
 import { IndexingResult } from './Interface'
 
 type Metadata = Record<string, unknown>
 
+export interface ExtendedRecordManagerInterface extends RecordManagerInterface {
+    update(keys: Array<{ uid: string; docId: string }> | string[], updateOptions?: Record<string, any>): Promise<void>
+}
+
 type StringOrDocFunc = string | ((doc: DocumentInterface) => string)
+
+/**
+ * Interface that defines the methods for loading and splitting documents.
+ */
+export interface DocumentLoader {
+    load(): Promise<Document[]>
+}
+
+/**
+ * Abstract class that provides a default implementation for the
+ * loadAndSplit() method from the DocumentLoader interface. The load()
+ * method is left abstract and needs to be implemented by subclasses.
+ */
+export abstract class BaseDocumentLoader implements DocumentLoader {
+    /**
+     * Loads the documents.
+     * @returns A Promise that resolves with an array of Document instances.
+     */
+    abstract load(): Promise<Document[]>
+}
 
 export interface HashedDocumentInterface extends DocumentInterface {
     uid: string
@@ -97,13 +120,13 @@ export class _HashedDocument implements HashedDocumentInterface {
     }
 
     private _hashStringToUUID(inputString: string): string {
-        const hash_value = insecureHash(inputString)
+        const hash_value = sha256(inputString)
         return uuidv5(hash_value, UUIDV5_NAMESPACE)
     }
 
     private _hashNestedDictToUUID(data: Record<string, unknown>): string {
         const serialized_data = JSON.stringify(data, Object.keys(data).sort())
-        const hash_value = insecureHash(serialized_data)
+        const hash_value = sha256(serialized_data)
         return uuidv5(hash_value, UUIDV5_NAMESPACE)
     }
 }
@@ -207,7 +230,7 @@ export const _isBaseDocumentLoader = (arg: any): arg is BaseDocumentLoader => {
 
 interface IndexArgs {
     docsSource: BaseDocumentLoader | DocumentInterface[]
-    recordManager: RecordManagerInterface
+    recordManager: ExtendedRecordManagerInterface
     vectorStore: VectorStore
     options?: IndexOptions
 }
@@ -275,7 +298,7 @@ export async function index(args: IndexArgs): Promise<IndexingResult> {
 
         const uids: string[] = []
         const docsToIndex: DocumentInterface[] = []
-        const docsToUpdate: string[] = []
+        const docsToUpdate: Array<{ uid: string; docId: string }> = []
         const seenDocs = new Set<string>()
         hashedDocs.forEach((hashedDoc, i) => {
             const docExists = batchExists[i]
@@ -283,7 +306,7 @@ export async function index(args: IndexArgs): Promise<IndexingResult> {
                 if (forceUpdate) {
                     seenDocs.add(hashedDoc.uid)
                 } else {
-                    docsToUpdate.push(hashedDoc.uid)
+                    docsToUpdate.push({ uid: hashedDoc.uid, docId: hashedDoc.metadata.docId as string })
                     return
                 }
             }
@@ -308,7 +331,7 @@ export async function index(args: IndexArgs): Promise<IndexingResult> {
         }
 
         await recordManager.update(
-            hashedDocs.map((doc) => doc.uid),
+            hashedDocs.map((doc) => ({ uid: doc.uid, docId: doc.metadata.docId as string })),
             { timeAtLeast: indexStartDt, groupIds: sourceIds }
         )
 

@@ -1,9 +1,9 @@
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { RequestInit } from 'node-fetch'
 import { RunnableConfig } from '@langchain/core/runnables'
 import { StructuredTool, ToolParams } from '@langchain/core/tools'
 import { CallbackManagerForToolRun, Callbacks, CallbackManager, parseCallbackConfigArg } from '@langchain/core/callbacks/manager'
-import { executeJavaScriptCode, createCodeExecutionSandbox } from '../../../src/utils'
+import { executeJavaScriptCode, createCodeExecutionSandbox, parseWithTypeConversion } from '../../../src/utils'
 import { ICommonObject } from '../../../src/Interface'
 
 const removeNulls = (obj: Record<string, any>) => {
@@ -174,7 +174,7 @@ export class DynamicStructuredTool<
         }
         let parsed
         try {
-            parsed = await this.schema.parseAsync(arg)
+            parsed = await parseWithTypeConversion(this.schema, arg)
         } catch (e) {
             throw new ToolInputParsingException(`Received tool input did not match expected schema ${e}`, JSON.stringify(arg))
         }
@@ -253,9 +253,7 @@ export class DynamicStructuredTool<
 
         const sandbox = createCodeExecutionSandbox('', this.variables || [], flow, additionalSandbox)
 
-        let response = await executeJavaScriptCode(this.customCode || defaultCode, sandbox, {
-            timeout: 10000
-        })
+        let response = await executeJavaScriptCode(this.customCode || defaultCode, sandbox)
 
         if (typeof response === 'object') {
             response = JSON.stringify(response)

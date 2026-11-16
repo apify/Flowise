@@ -199,7 +199,7 @@ class ExecuteFlow_SeqAgents implements INode {
             if (seqExecuteFlowInput === 'userQuestion') {
                 flowInput = input
             } else if (seqExecuteFlowInput && seqExecuteFlowInput.startsWith('{{') && seqExecuteFlowInput.endsWith('}}')) {
-                const nodeId = seqExecuteFlowInput.replace('{{', '').replace('}}', '').replace('$', '').trim()
+                const nodeId = seqExecuteFlowInput.replace('{{', '').replace('}}', '').replace(/\$/g, '').trim()
                 const messageOutputs = ((state.messages as unknown as BaseMessage[]) ?? []).filter(
                     (message) => message.additional_kwargs && message.additional_kwargs?.nodeId === nodeId
                 )
@@ -239,19 +239,20 @@ class ExecuteFlow_SeqAgents implements INode {
             // Create additional sandbox variables
             const additionalSandbox: ICommonObject = {
                 $callOptions: callOptions,
-                $callBody: body
+                $callBody: body,
+                $apiURL: `${baseURL}/api/v1/prediction/${selectedFlowId}`
             }
 
             const sandbox = createCodeExecutionSandbox(flowInput, variables, flow, additionalSandbox)
 
             const code = `
     const fetch = require('node-fetch');
-    const url = "${baseURL}/api/v1/prediction/${selectedFlowId}";
-    
+    const url = $apiURL;
+
     const body = $callBody;
-    
+
     const options = $callOptions;
-    
+
     try {
         const response = await fetch(url, options);
         const resp = await response.json();
@@ -264,8 +265,7 @@ class ExecuteFlow_SeqAgents implements INode {
 
             try {
                 let response = await executeJavaScriptCode(code, sandbox, {
-                    useSandbox: false,
-                    timeout: 10000
+                    useSandbox: false
                 })
 
                 if (typeof response === 'object') {

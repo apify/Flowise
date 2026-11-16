@@ -4,7 +4,9 @@ import { BaseCache } from '@langchain/core/caches'
 import { ICommonObject, IMultiModalOption, INode, INodeData, INodeOptionsValue, INodeParams } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils'
 import { getModels, MODEL_TYPE } from '../../../src/modelLoader'
-import { ChatGoogleGenerativeAI, GoogleGenerativeAIChatInput } from './FlowiseChatGoogleGenerativeAI'
+import { GoogleGenerativeAIChatInput } from '@langchain/google-genai'
+import { ChatGoogleGenerativeAI } from './FlowiseChatGoogleGenerativeAI'
+import { checkDenyList } from '../../../src/httpSecurity'
 
 class GoogleGenerativeAI_ChatModels implements INode {
     label: string
@@ -19,7 +21,7 @@ class GoogleGenerativeAI_ChatModels implements INode {
     inputs: INodeParams[]
 
     constructor() {
-        this.label = 'ChatGoogleGenerativeAI'
+        this.label = 'Google Gemini'
         this.name = 'chatGoogleGenerativeAI'
         this.version = 3.1
         this.type = 'ChatGoogleGenerativeAI'
@@ -73,6 +75,53 @@ class GoogleGenerativeAI_ChatModels implements INode {
                 default: true,
                 optional: true,
                 additionalParams: true
+            },
+            {
+                label: 'Allow Image Uploads',
+                name: 'allowImageUploads',
+                type: 'boolean',
+                description:
+                    'Allow image input. Refer to the <a href="https://docs.flowiseai.com/using-flowise/uploads#image" target="_blank">docs</a> for more details.',
+                default: false,
+                optional: true
+            },
+            /** The thinkingLevel parameter, recommended for Gemini 3 models and onwards. */
+            {
+                label: 'Thinking Budget',
+                name: 'thinkingBudget',
+                type: 'number',
+                description: 'Guides the number of thinking tokens. -1 for dynamic, 0 to disable, or positive integer (Gemini 2.5 models).',
+                step: 1,
+                optional: true,
+                additionalParams: true,
+                show: {
+                    modelName: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']
+                }
+            },
+            {
+                label: 'Thinking Level',
+                name: 'thinkingLevel',
+                type: 'options',
+                description: 'Adjust the amount of reasoning effort based on the complexity of the user request',
+                options: [
+                    {
+                        label: 'Low',
+                        name: 'LOW'
+                    },
+                    {
+                        label: 'Medium',
+                        name: 'MEDIUM'
+                    },
+                    {
+                        label: 'High',
+                        name: 'HIGH'
+                    }
+                ],
+                optional: true,
+                additionalParams: true,
+                show: {
+                    modelName: ['gemini-3.1-pro-preview', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview']
+                }
             },
             {
                 label: 'Max Output Tokens',
@@ -181,15 +230,6 @@ class GoogleGenerativeAI_ChatModels implements INode {
                 description: 'Base URL for the API. Leave empty to use the default.',
                 optional: true,
                 additionalParams: true
-            },
-            {
-                label: 'Allow Image Uploads',
-                name: 'allowImageUploads',
-                type: 'boolean',
-                description:
-                    'Allow image input. Refer to the <a href="https://docs.flowiseai.com/using-flowise/uploads#image" target="_blank">docs</a> for more details.',
-                default: false,
-                optional: true
             }
         ]
     }
@@ -216,6 +256,8 @@ class GoogleGenerativeAI_ChatModels implements INode {
         const cache = nodeData.inputs?.cache as BaseCache
         const streaming = nodeData.inputs?.streaming as boolean
         const baseUrl = nodeData.inputs?.baseUrl as string | undefined
+        const thinkingBudget = nodeData.inputs?.thinkingBudget as string
+        const thinkingLevel = nodeData.inputs?.thinkingLevel as 'LOW' | 'MEDIUM' | 'HIGH'
 
         const allowImageUploads = nodeData.inputs?.allowImageUploads as boolean
 
@@ -234,7 +276,21 @@ class GoogleGenerativeAI_ChatModels implements INode {
         if (topK) obj.topK = parseFloat(topK)
         if (cache) obj.cache = cache
         if (temperature) obj.temperature = parseFloat(temperature)
-        if (baseUrl) obj.baseUrl = baseUrl
+        if (baseUrl) {
+            await checkDenyList(baseUrl)
+            obj.baseUrl = baseUrl
+        }
+        if (thinkingLevel) {
+            obj.thinkingConfig = {
+                thinkingLevel: thinkingLevel,
+                includeThoughts: true
+            }
+        } else if (thinkingBudget) {
+            obj.thinkingConfig = {
+                thinkingBudget: parseInt(thinkingBudget, 10),
+                includeThoughts: true
+            }
+        }
 
         let safetySettings: SafetySetting[] = []
         if (_safetySettings) {

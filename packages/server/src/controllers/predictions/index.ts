@@ -25,7 +25,9 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                 `Error: predictionsController.createPrediction - body not provided!`
             )
         }
-        const chatflow = await chatflowsService.getChatflowById(req.params.id)
+        const workspaceId = req.user?.activeWorkspaceId
+
+        const chatflow = await chatflowsService.getChatflowById(req.params.id, workspaceId)
         if (!chatflow) {
             throw new InternalFlowiseError(StatusCodes.NOT_FOUND, `Chatflow ${req.params.id} not found`)
         }
@@ -62,6 +64,7 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                     chatId = req.body.chatId ?? req.body.overrideConfig?.sessionId ?? uuidv4()
                     req.body.chatId = chatId
                 }
+                const isQueueMode = process.env.MODE === MODE.QUEUE
                 try {
                     sseStreamer.addExternalClient(chatId, res)
                     res.setHeader('Content-Type', 'text/event-stream')
@@ -70,8 +73,8 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                     res.setHeader('X-Accel-Buffering', 'no') //nginx config: https://serverfault.com/a/801629
                     res.flushHeaders()
 
-                    if (process.env.MODE === MODE.QUEUE) {
-                        getRunningExpressApp().redisSubscriber.subscribe(chatId)
+                    if (isQueueMode) {
+                        await getRunningExpressApp().redisSubscriber.subscribe(chatId)
                     }
 
                     const apiResponse = await predictionsServices.buildChatflow(req)
@@ -82,6 +85,9 @@ const createPrediction = async (req: Request, res: Response, next: NextFunction)
                     }
                     next(error)
                 } finally {
+                    if (isQueueMode && chatId) {
+                        await getRunningExpressApp().redisSubscriber.unsubscribe(chatId)
+                    }
                     sseStreamer.removeClient(chatId)
                 }
             } else {

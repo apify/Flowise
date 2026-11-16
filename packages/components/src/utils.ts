@@ -1,25 +1,28 @@
+import { GetSecretValueCommand, SecretsManagerClient, SecretsManagerClientConfig } from '@aws-sdk/client-secrets-manager'
+import { Sandbox } from '@e2b/code-interpreter'
+import { DocumentLoader } from '@langchain/classic/document_loaders/base'
+import { Document } from '@langchain/core/documents'
+import { BaseChatModel } from '@langchain/core/language_models/chat_models'
+import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage } from '@langchain/core/messages'
+import { Runnable, type RunnableConfig } from '@langchain/core/runnables'
+import { TextSplitter } from '@langchain/textsplitters'
 import axios from 'axios'
 import { load } from 'cheerio'
+import { AES, enc } from 'crypto-js'
 import * as fs from 'fs'
-import * as path from 'path'
 import { JSDOM } from 'jsdom'
-import { z } from 'zod'
+import JSON5 from 'json5'
+import { cloneDeep, get, omit } from 'lodash'
+import * as path from 'path'
 import TurndownService from 'turndown'
 import { DataSource, Equal } from 'typeorm'
-import { ICommonObject, IDatabaseEntity, IFileUpload, IMessage, INodeData, IVariable, MessageContentImageUrl } from './Interface'
-import { AES, enc } from 'crypto-js'
-import { omit, get } from 'lodash'
-import { AIMessage, HumanMessage, BaseMessage } from '@langchain/core/messages'
-import { Document } from '@langchain/core/documents'
-import { getFileFromStorage } from './storageUtils'
-import { GetSecretValueCommand, SecretsManagerClient, SecretsManagerClientConfig } from '@aws-sdk/client-secrets-manager'
+import { NodeVM } from 'vm2'
+import zodToJsonSchema, { type JsonSchema7Type } from 'zod-to-json-schema'
+import { z } from 'zod/v3'
 import { customGet } from '../nodes/sequentialagents/commonUtils'
-import { TextSplitter } from 'langchain/text_splitter'
-import { DocumentLoader } from 'langchain/document_loaders/base'
-import { NodeVM } from '@flowiseai/nodevm'
-import { Sandbox } from '@e2b/code-interpreter'
-import { secureFetch, checkDenyList } from './httpSecurity'
-import JSON5 from 'json5'
+import { checkDenyList, secureAxiosRequest, secureFetch } from './httpSecurity'
+import { ICommonObject, IDatabaseEntity, IFileUpload, IMessage, INodeData, IVariable, MessageContentImageUrl } from './Interface'
+import { getFileFromStorage } from './storageUtils'
 
 export const numberOrExpressionRegex = '^(\\d+\\.?\\d*|{{.*}})$' //return true if string consists only numbers OR expression {{}}
 export const notEmptyRegex = '(.|\\s)*\\S(.|\\s)*' //return true if string is not empty or blank
@@ -48,6 +51,9 @@ if (USE_AWS_SECRETS_MANAGER) {
 
 /*
  * List of dependencies allowed to be import in @flowiseai/nodevm
+ *
+ * Do NOT add 'puppeteer' or 'playwright' here (or via TOOL_FUNCTION_EXTERNAL_DEP): their launch()
+ * APIs forward executablePath/args to child_process.spawn, which is a sandbox escape.
  */
 export const availableDependencies = [
     '@aws-sdk/client-bedrock-runtime',
@@ -83,9 +89,7 @@ export const availableDependencies = [
     '@qdrant/js-client-rest',
     '@supabase/supabase-js',
     '@upstash/redis',
-    '@zilliz/milvus2-sdk-node',
     'apify-client',
-    'axios',
     'cheerio',
     'chromadb',
     'cohere-ai',
@@ -95,7 +99,6 @@ export const availableDependencies = [
     'google-auth-library',
     'graphql',
     'html-to-text',
-    'ioredis',
     'langchain',
     'langfuse',
     'langsmith',
@@ -103,40 +106,19 @@ export const availableDependencies = [
     'linkifyjs',
     'lunary',
     'mammoth',
-    'moment',
-    'mongodb',
-    'mysql2',
-    'node-fetch',
     'node-html-markdown',
     'notion-to-md',
     'openai',
     'pdf-parse',
     'pdfjs-dist',
-    'pg',
-    'playwright',
-    'puppeteer',
-    'redis',
     'replicate',
     'srt-parser-2',
-    'typeorm',
-    'weaviate-ts-client'
+    'weaviate-client'
 ]
 
-export const defaultAllowBuiltInDep = [
-    'assert',
-    'buffer',
-    'crypto',
-    'events',
-    'http',
-    'https',
-    'net',
-    'path',
-    'querystring',
-    'timers',
-    'tls',
-    'url',
-    'zlib'
-]
+const defaultAllowExternalDependencies = ['axios', 'node-fetch']
+
+export const defaultAllowBuiltInDep = ['assert', 'buffer', 'crypto', 'events', 'path', 'querystring', 'timers', 'url', 'zlib']
 
 /**
  * Get base classes of components
@@ -313,6 +295,57 @@ export const transformBracesWithColon = (input: string): string => {
             return match
         }
     })
+}
+
+/**
+ * Extracts text content from an AIMessageChunk, filtering out reasoning/thinking
+ * content blocks that reasoning models may return.
+ */
+const extractTextFromChunk = (response: AIMessageChunk): string => {
+    if (typeof response.content === 'string') {
+        return response.content
+    }
+    if (Array.isArray(response.content)) {
+        return response.content
+            .filter((block: any) => block.type === 'text' || block.type === 'text_delta')
+            .map((block: any) => block.text ?? '')
+            .join('')
+    }
+    return ''
+}
+
+/**
+ * Creates a streaming-compatible output parser that extracts text content from
+ * chat model responses, filtering out reasoning/thinking content blocks.
+ * https://github.com/FlowiseAI/Flowise/pull/5893#issuecomment-4045466531
+ */
+export const createTextOnlyOutputParser = () => {
+    return new TextOnlyOutputParser()
+}
+
+class TextOnlyOutputParser extends Runnable<AIMessageChunk, string> {
+    static lc_name() {
+        return 'TextOnlyOutputParser'
+    }
+
+    lc_namespace = ['flowise', 'output_parsers']
+
+    async invoke(input: AIMessageChunk, _options?: Partial<RunnableConfig>): Promise<string> {
+        return extractTextFromChunk(input)
+    }
+
+    async *_transform(generator: AsyncGenerator<AIMessageChunk>): AsyncGenerator<string> {
+        for await (const chunk of generator) {
+            const text = extractTextFromChunk(chunk)
+            if (text) {
+                yield text
+            }
+        }
+    }
+
+    async *transform(generator: AsyncGenerator<AIMessageChunk>, options?: Partial<RunnableConfig>): AsyncGenerator<string> {
+        yield* this._transformStreamWithConfig(generator, this._transform.bind(this), options)
+    }
 }
 
 /**
@@ -572,7 +605,7 @@ const getEncryptionKey = async (): Promise<string> => {
  * @param {IComponentCredentials} componentCredentials
  * @returns {Promise<ICommonObject>}
  */
-const decryptCredentialData = async (encryptedData: string): Promise<ICommonObject> => {
+export const decryptCredentialData = async (encryptedData: string): Promise<ICommonObject> => {
     let decryptedDataStr: string
 
     if (USE_AWS_SECRETS_MANAGER && secretsManagerClient) {
@@ -949,7 +982,7 @@ export const getVars = async (
     nodeData: INodeData,
     options: ICommonObject
 ) => {
-    if (!options.workspaceId) {
+    if (!options.workspaceId || options.skipVariables) {
         return []
     }
     const variables =
@@ -1130,6 +1163,18 @@ export const mapMimeTypeToExt = (mimeType: string) => {
         case 'application/jsonl':
         case 'text/jsonl':
             return 'jsonl'
+        // YAML types
+        case 'application/vnd.yaml':
+        case 'application/x-yaml':
+        case 'text/vnd.yaml':
+        case 'text/x-yaml':
+        case 'text/yaml':
+            return 'yaml'
+        // SQL types
+        case 'application/sql':
+        case 'text/x-sql':
+            return 'sql'
+        // Document types
         case 'application/msword':
             return 'doc'
         case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
@@ -1142,14 +1187,130 @@ export const mapMimeTypeToExt = (mimeType: string) => {
             return 'ppt'
         case 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
             return 'pptx'
+        case 'application/rtf':
+            return 'rtf'
+        // Image types
+        case 'image/jpeg':
+        case 'image/jpg':
+            return 'jpg'
+        case 'image/png':
+            return 'png'
+        case 'image/gif':
+            return 'gif'
+        case 'image/webp':
+            return 'webp'
+        case 'image/svg+xml':
+            return 'svg'
+        case 'image/bmp':
+            return 'bmp'
+        case 'image/tiff':
+        case 'image/tif':
+            return 'tiff'
+        case 'image/x-icon':
+        case 'image/vnd.microsoft.icon':
+            return 'ico'
+        case 'image/avif':
+            return 'avif'
+        // Audio types
+        case 'audio/webm':
+            return 'webm'
+        case 'audio/mp4':
+        case 'audio/x-m4a':
+            return 'm4a'
+        case 'audio/mpeg':
+        case 'audio/mp3':
+            return 'mp3'
+        case 'audio/ogg':
+        case 'audio/oga':
+            return 'ogg'
+        case 'audio/wav':
+        case 'audio/wave':
+        case 'audio/x-wav':
+            return 'wav'
+        case 'audio/aac':
+            return 'aac'
+        case 'audio/flac':
+            return 'flac'
+        // Video types
+        case 'video/mp4':
+            return 'mp4'
+        case 'video/webm':
+            return 'webm'
+        case 'video/quicktime':
+            return 'mov'
+        case 'video/x-msvideo':
+            return 'avi'
         default:
             return ''
     }
 }
 
+/**
+ * MIME types allowed for full file upload (chatflow config).
+ * Server validates stored allowedUploadFileTypes against this list to prevent
+ * malicious clients from allowing executables or other dangerous types.
+ * Uses a Set for O(1) lookups and to make the unique allowed set explicit.
+ */
+export const ALLOWED_UPLOAD_MIME_TYPES: ReadonlySet<string> = new Set([
+    'text/css',
+    'text/csv',
+    'text/html',
+    'application/json',
+    'text/markdown',
+    'application/x-yaml',
+    'application/pdf',
+    'application/sql',
+    'text/plain',
+    'application/xml',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+])
+
+/**
+ * Returns true if the MIME type is allowed for file upload config.
+ * Must be in ALLOWED_UPLOAD_MIME_TYPES and have a mapping in mapMimeTypeToExt.
+ * @param {string} mime
+ * @returns {boolean}
+ */
+export const isAllowedUploadMimeType = (mime: string): boolean => {
+    if (!mime || typeof mime !== 'string') return false
+    const trimmed = mime.trim()
+    if (!trimmed) return false
+    return ALLOWED_UPLOAD_MIME_TYPES.has(trimmed) && mapMimeTypeToExt(trimmed) !== ''
+}
+
 // remove invalid markdown image pattern: ![<some-string>](<some-string>)
+// Uses indexOf instead of a global regex to avoid O(n²) backtracking when the
+// input contains many '![' sequences (polynomial ReDoS with the g flag).
 export const removeInvalidImageMarkdown = (output: string): string => {
-    return typeof output === 'string' ? output.replace(/!\[.*?\]\((?!https?:\/\/).*?\)/g, '') : output
+    if (typeof output !== 'string') return output
+    let result = ''
+    let pos = 0
+    while (pos < output.length) {
+        const start = output.indexOf('![', pos)
+        if (start === -1) {
+            result += output.slice(pos)
+            break
+        }
+        result += output.slice(pos, start)
+        const closeBracket = output.indexOf(']', start + 2)
+        if (closeBracket === -1 || output[closeBracket + 1] !== '(') {
+            result += '!['
+            pos = start + 2
+            continue
+        }
+        const closeParen = output.indexOf(')', closeBracket + 2)
+        if (closeParen === -1) {
+            result += output.slice(start)
+            break
+        }
+        const url = output.slice(closeBracket + 2, closeParen)
+        if (/^https?:\/\//.test(url)) result += output.slice(start, closeParen + 1)
+        pos = closeParen + 1
+    }
+    return result
 }
 
 /**
@@ -1355,8 +1516,12 @@ export const stripHTMLFromToolInput = (input: string) => {
     return cleanedInput
 }
 
+// Regex constants exported for testability
+export const COMMONJS_REQUIRE_REGEX = /^(const|let|var)\s+\S[^=]*=\s*require\s*\(/
+export const IMPORT_EXTRACTION_REGEX = /(?:import\s+\S[^\n]*?\s+from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\))/
+
 // Helper function to convert require statements to ESM imports
-const convertRequireToImport = (requireLine: string): string | null => {
+export const convertRequireToImport = (requireLine: string): string | null => {
     // Remove leading/trailing whitespace and get the indentation
     const indent = requireLine.match(/^(\s*)/)?.[1] || ''
     const trimmed = requireLine.trim()
@@ -1369,7 +1534,7 @@ const convertRequireToImport = (requireLine: string): string | null => {
     }
 
     // Match patterns like: const { name1, name2 } = require('module')
-    const destructureMatch = trimmed.match(/^(const|let|var)\s+\{\s*([^}]+)\s*\}\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/)
+    const destructureMatch = trimmed.match(/^(const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/)
     if (destructureMatch) {
         const [, , destructuredVars, moduleName] = destructureMatch
         return `${indent}import { ${destructuredVars.trim()} } from '${moduleName}';`
@@ -1408,7 +1573,7 @@ const parseOutput = (output: any): any => {
     // Check if it looks like JSON (starts with { or [)
     if ((trimmedOutput.startsWith('{') && trimmedOutput.endsWith('}')) || (trimmedOutput.startsWith('[') && trimmedOutput.endsWith(']'))) {
         try {
-            const parsedOutput = JSON5.parse(trimmedOutput)
+            const parsedOutput = parseJsonBody(trimmedOutput)
             return parsedOutput
         } catch (e) {
             return output
@@ -1438,9 +1603,14 @@ export const executeJavaScriptCode = async (
     } = {}
 ): Promise<any> => {
     const { timeout = 300000, useSandbox = true, streamOutput, libraries = [], nodeVMOptions = {} } = options
-    const shouldUseSandbox = useSandbox && process.env.E2B_APIKEY
+    const shouldUseE2BSandbox = useSandbox && process.env.E2B_APIKEY
 
-    if (shouldUseSandbox) {
+    let timeoutMs = timeout
+    if (process.env.SANDBOX_TIMEOUT) {
+        timeoutMs = parseInt(process.env.SANDBOX_TIMEOUT, 10)
+    }
+
+    if (shouldUseE2BSandbox) {
         try {
             const variableDeclarations = []
 
@@ -1485,7 +1655,7 @@ export const executeJavaScriptCode = async (
                     importLines.push(line)
                 }
                 // Check for CommonJS require statements and convert them to ESM imports
-                else if (/^(const|let|var)\s+.*=\s*require\s*\(/.test(trimmedLine)) {
+                else if (COMMONJS_REQUIRE_REGEX.test(trimmedLine)) {
                     const convertedImport = convertRequireToImport(trimmedLine)
                     if (convertedImport) {
                         importLines.push(convertedImport)
@@ -1495,11 +1665,31 @@ export const executeJavaScriptCode = async (
                 }
             }
 
-            const sbx = await Sandbox.create({ apiKey: process.env.E2B_APIKEY, timeoutMs: timeout })
+            const sbx = await Sandbox.create({ apiKey: process.env.E2B_APIKEY, timeoutMs })
+
+            // Determine which libraries to install
+            const librariesToInstall = new Set<string>(libraries)
+
+            // Auto-detect required libraries from code
+            // Extract required modules from import/require statements
+            const importRegex = new RegExp(IMPORT_EXTRACTION_REGEX.source, 'g')
+            let match
+            while ((match = importRegex.exec(code)) !== null) {
+                const moduleName = match[1] || match[2]
+                // Extract base module name (e.g., 'typeorm' from 'typeorm/something')
+                const baseModuleName = moduleName.split('/')[0]
+                librariesToInstall.add(baseModuleName)
+            }
 
             // Install libraries
-            for (const library of libraries) {
-                await sbx.commands.run(`npm install ${library}`)
+            for (const library of librariesToInstall) {
+                // Validate library name to prevent command injection.
+                const validPackageNameRegex = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/
+                if (validPackageNameRegex.test(library)) {
+                    await sbx.commands.run(`npm install ${library}`)
+                } else {
+                    console.warn(`[Sandbox] Skipping installation of invalid module: ${library}`)
+                }
             }
 
             // Separate imports from the rest of the code for proper ES6 module structure
@@ -1543,22 +1733,60 @@ export const executeJavaScriptCode = async (
             ? defaultAllowBuiltInDep.concat(process.env.TOOL_FUNCTION_BUILTIN_DEP.split(','))
             : defaultAllowBuiltInDep
         const externalDeps = process.env.TOOL_FUNCTION_EXTERNAL_DEP ? process.env.TOOL_FUNCTION_EXTERNAL_DEP.split(',') : []
-        const deps = process.env.ALLOW_BUILTIN_DEP === 'true' ? availableDependencies.concat(externalDeps) : externalDeps
+        let deps = process.env.ALLOW_BUILTIN_DEP === 'true' ? availableDependencies.concat(externalDeps) : externalDeps
+        deps.push(...defaultAllowExternalDependencies)
+        deps = [...new Set(deps)]
+
+        // Create secure wrappers for HTTP libraries
+        const secureWrappers: ICommonObject = {}
+
+        // Axios
+        const secureAxiosWrapper = async (config: any) => {
+            return await secureAxiosRequest(config)
+        }
+        secureAxiosWrapper.get = async (url: string, config: any = {}) => secureAxiosWrapper({ ...config, method: 'GET', url })
+        secureAxiosWrapper.post = async (url: string, data: any, config: any = {}) =>
+            secureAxiosWrapper({ ...config, method: 'POST', url, data })
+        secureAxiosWrapper.put = async (url: string, data: any, config: any = {}) =>
+            secureAxiosWrapper({ ...config, method: 'PUT', url, data })
+        secureAxiosWrapper.delete = async (url: string, config: any = {}) => secureAxiosWrapper({ ...config, method: 'DELETE', url })
+        secureAxiosWrapper.patch = async (url: string, data: any, config: any = {}) =>
+            secureAxiosWrapper({ ...config, method: 'PATCH', url, data })
+
+        secureWrappers['axios'] = secureAxiosWrapper
+
+        // Node Fetch
+        const secureNodeFetch = async (url: string, options: any = {}) => {
+            return await secureFetch(url, options)
+        }
+        secureWrappers['node-fetch'] = secureNodeFetch
 
         const defaultNodeVMOptions: any = {
             console: 'inherit',
             sandbox,
             require: {
-                external: { modules: deps },
-                builtin: builtinDeps
+                external: {
+                    modules: deps,
+                    transitive: false // Prevent transitive dependencies
+                },
+                builtin: builtinDeps,
+                mock: secureWrappers // Replace HTTP libraries with secure wrappers
             },
             eval: false,
             wasm: false,
-            timeout
+            fixAsync: true,
+            timeout: timeoutMs
         }
 
         // Merge with custom nodeVMOptions if provided
-        const finalNodeVMOptions = { ...defaultNodeVMOptions, ...nodeVMOptions }
+        const finalNodeVMOptions = {
+            ...defaultNodeVMOptions,
+            ...nodeVMOptions,
+            require: defaultNodeVMOptions.require,
+            eval: false,
+            wasm: false,
+            fixAsync: true
+        }
 
         const vm = new NodeVM(finalNodeVMOptions)
 
@@ -1658,4 +1886,459 @@ export const processTemplateVariables = (state: ICommonObject, finalOutput: any)
     }
 
     return newState
+}
+
+/**
+ * Parse JSON body with comprehensive error handling and cleanup
+ * @param {string} body - The JSON string to parse
+ * @returns {any} - The parsed JSON object
+ * @throws {Error} - Detailed error message with suggestions for common JSON issues
+ */
+export const parseJsonBody = (body: string): any => {
+    try {
+        // First try to parse as-is with JSON5 (which handles more cases than standard JSON)
+        return JSON5.parse(body)
+    } catch (error) {
+        try {
+            // If that fails, try to clean up common issues
+            let cleanedBody = body
+
+            // 1. Remove unnecessary backslash escapes for square brackets and braces
+            // eslint-disable-next-line
+            cleanedBody = cleanedBody.replace(/\\(?=[\[\]{}])/g, '')
+
+            // 2. Fix single quotes to double quotes (but preserve quotes inside strings)
+            cleanedBody = cleanedBody.replace(/'/g, '"')
+
+            // 3. Remove trailing commas before closing brackets/braces
+            cleanedBody = cleanedBody.replace(/,(\s*[}\]])/g, '$1')
+
+            // 4. Remove comments (// and /* */)
+            cleanedBody = cleanedBody
+                .replace(/\/\/.*$/gm, '') // Remove single-line comments
+                .replace(/\/\*[\s\S]*?\*\//g, '') // Remove multi-line comments
+
+            return JSON5.parse(cleanedBody)
+        } catch (secondError) {
+            try {
+                // 3rd attempt: try with standard JSON.parse on original body
+                return JSON.parse(body)
+            } catch (thirdError) {
+                try {
+                    // 4th attempt: try with standard JSON.parse on cleaned body
+                    const finalCleanedBody = body
+                        // eslint-disable-next-line
+                        .replace(/\\(?=[\[\]{}])/g, '') // Basic escape cleanup
+                        .replace(/,(\s*[}\]])/g, '$1') // Remove trailing commas
+                        .trim()
+
+                    return JSON.parse(finalCleanedBody)
+                } catch (fourthError) {
+                    // Provide comprehensive error message with suggestions
+                    const suggestions = [
+                        '• Ensure all strings are enclosed in double quotes',
+                        '• Remove trailing commas',
+                        '• Remove comments (// or /* */)',
+                        '• Escape special characters properly (\\n for newlines, \\" for quotes)',
+                        '• Use double quotes instead of single quotes',
+                        '• Remove unnecessary backslashes before brackets [ ] { }'
+                    ]
+
+                    throw new Error(
+                        `Invalid JSON format in body. Original error: ${error.message}. ` +
+                            `After cleanup attempts: ${secondError.message}. 3rd attempt: ${thirdError.message}. Final attempt: ${fourthError.message}.\n\n` +
+                            `Common fixes:\n${suggestions.join('\n')}\n\n` +
+                            `Received body: ${body.substring(0, 200)}${body.length > 200 ? '...' : ''}`
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Parse a value against a Zod schema with automatic type conversion for common type mismatches
+ * @param schema - The Zod schema to parse against
+ * @param arg - The value to parse
+ * @param maxDepth - Maximum recursion depth to prevent infinite loops (default: 10)
+ * @returns The parsed value
+ * @throws Error if parsing fails after attempting type conversions
+ */
+export async function parseWithTypeConversion<T extends z.ZodTypeAny>(schema: T, arg: unknown, maxDepth: number = 10): Promise<z.infer<T>> {
+    // Safety check: prevent infinite recursion
+    if (maxDepth <= 0) {
+        throw new Error('Maximum recursion depth reached in parseWithTypeConversion')
+    }
+
+    try {
+        return await schema.parseAsync(arg)
+    } catch (e) {
+        // Check if it's a ZodError and try to fix type mismatches
+        if (z.ZodError && e instanceof z.ZodError) {
+            const zodError = e as z.ZodError
+            // Deep clone the arg to avoid mutating the original
+            const modifiedArg = typeof arg === 'object' && arg !== null ? cloneDeep(arg) : arg
+            let hasModification = false
+
+            // Helper function to set a value at a nested path
+            const setValueAtPath = (obj: any, path: (string | number)[], value: any): void => {
+                let current = obj
+                for (let i = 0; i < path.length - 1; i++) {
+                    const key = path[i]
+                    if (current && typeof current === 'object' && key in current) {
+                        current = current[key]
+                    } else {
+                        return // Path doesn't exist
+                    }
+                }
+                if (current !== undefined && current !== null) {
+                    const finalKey = path[path.length - 1]
+                    current[finalKey] = value
+                }
+            }
+
+            // Helper function to get a value at a nested path
+            const getValueAtPath = (obj: any, path: (string | number)[]): any => {
+                let current = obj
+                for (const key of path) {
+                    if (current && typeof current === 'object' && key in current) {
+                        current = current[key]
+                    } else {
+                        return undefined
+                    }
+                }
+                return current
+            }
+
+            // Helper function to convert value to expected type
+            const convertValue = (value: any, expected: string, received: string): any => {
+                // Expected string
+                if (expected === 'string') {
+                    if (received === 'object' || received === 'array') {
+                        return JSON.stringify(value)
+                    }
+                    if (received === 'number' || received === 'boolean') {
+                        return String(value)
+                    }
+                }
+                // Expected number
+                else if (expected === 'number') {
+                    if (received === 'string') {
+                        const parsed = parseFloat(value)
+                        if (!isNaN(parsed)) {
+                            return parsed
+                        }
+                    }
+                    if (received === 'boolean') {
+                        return value ? 1 : 0
+                    }
+                }
+                // Expected boolean
+                else if (expected === 'boolean') {
+                    if (received === 'string') {
+                        const lower = String(value).toLowerCase().trim()
+                        if (lower === 'true' || lower === '1' || lower === 'yes') {
+                            return true
+                        }
+                        if (lower === 'false' || lower === '0' || lower === 'no') {
+                            return false
+                        }
+                    }
+                    if (received === 'number') {
+                        return value !== 0
+                    }
+                }
+                // Expected object
+                else if (expected === 'object') {
+                    if (received === 'string') {
+                        try {
+                            const parsed = JSON.parse(value)
+                            if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+                                return parsed
+                            }
+                        } catch {
+                            // Invalid JSON, return undefined to skip conversion
+                        }
+                    }
+                }
+                // Expected array
+                else if (expected === 'array') {
+                    if (received === 'string') {
+                        try {
+                            const parsed = JSON.parse(value)
+                            if (Array.isArray(parsed)) {
+                                return parsed
+                            }
+                        } catch {
+                            // Invalid JSON, return undefined to skip conversion
+                        }
+                    }
+                    if (received === 'object' && value !== null) {
+                        // Convert object to array (e.g., {0: 'a', 1: 'b'} -> ['a', 'b'])
+                        // Only if it looks like an array-like object
+                        const keys = Object.keys(value)
+                        const numericKeys = keys.filter((k) => /^\d+$/.test(k))
+                        if (numericKeys.length === keys.length) {
+                            return numericKeys.map((k) => value[k])
+                        }
+                    }
+                }
+                return undefined // No conversion possible
+            }
+
+            // Process each issue in the error
+            for (const issue of zodError.issues) {
+                // Handle invalid_type errors (type mismatches)
+                if (issue.code === 'invalid_type' && issue.path.length > 0) {
+                    try {
+                        const valueAtPath = getValueAtPath(modifiedArg, issue.path)
+                        if (valueAtPath !== undefined) {
+                            const convertedValue = convertValue(valueAtPath, issue.expected, issue.received)
+                            if (convertedValue !== undefined) {
+                                setValueAtPath(modifiedArg, issue.path, convertedValue)
+                                hasModification = true
+                            }
+                        }
+                    } catch (pathError) {
+                        console.error('Error processing path in Zod error', pathError)
+                    }
+                }
+            }
+
+            // If we modified the arg, recursively call parseWithTypeConversion
+            // This allows newly surfaced nested errors to also get conversion treatment
+            // Decrement maxDepth to prevent infinite recursion
+            if (hasModification) {
+                return await parseWithTypeConversion(schema, modifiedArg, maxDepth - 1)
+            }
+        }
+        // Re-throw the original error if not a ZodError or no conversion possible
+        throw e
+    }
+}
+
+/**
+ * Configures structured output for the LLM using Zod schema
+ * @param {BaseChatModel} llmNodeInstance - The LLM instance to configure
+ * @param {any[]} structuredOutput - Array of structured output schema definitions
+ * @returns {BaseChatModel} - The configured LLM instance
+ */
+export const configureStructuredOutput = (llmNodeInstance: BaseChatModel, structuredOutput: any[]): BaseChatModel => {
+    try {
+        const zodObj: ICommonObject = {}
+        for (const sch of structuredOutput) {
+            if (sch.type === 'string') {
+                zodObj[sch.key] = z.string().describe(sch.description || '')
+            } else if (sch.type === 'stringArray') {
+                zodObj[sch.key] = z.array(z.string()).describe(sch.description || '')
+            } else if (sch.type === 'number') {
+                zodObj[sch.key] = z.number().describe(sch.description || '')
+            } else if (sch.type === 'boolean') {
+                zodObj[sch.key] = z.boolean().describe(sch.description || '')
+            } else if (sch.type === 'enum') {
+                const enumValues = sch.enumValues?.split(',').map((item: string) => item.trim()) || []
+                zodObj[sch.key] = z
+                    .enum(enumValues.length ? (enumValues as [string, ...string[]]) : ['default'])
+                    .describe(sch.description || '')
+            } else if (sch.type === 'jsonArray') {
+                const jsonSchema = sch.jsonSchema
+                if (jsonSchema) {
+                    try {
+                        // Parse the JSON schema
+                        const schemaObj = JSON.parse(jsonSchema)
+
+                        // Create a Zod schema from the JSON schema
+                        const itemSchema = createZodSchemaFromJSON(schemaObj)
+
+                        // Create an array schema of the item schema
+                        zodObj[sch.key] = z.array(itemSchema).describe(sch.description || '')
+                    } catch (err) {
+                        console.error(`Error parsing JSON schema for ${sch.key}:`, err)
+                        // Fallback to generic array of records
+                        zodObj[sch.key] = z.array(z.record(z.any())).describe(sch.description || '')
+                    }
+                } else {
+                    // If no schema provided, use generic array of records
+                    zodObj[sch.key] = z.array(z.record(z.any())).describe(sch.description || '')
+                }
+            }
+        }
+        const structuredOutputSchema = z.object(zodObj)
+
+        // @ts-ignore
+        return llmNodeInstance.withStructuredOutput(structuredOutputSchema, {
+            method: 'functionCalling'
+        })
+    } catch (exception) {
+        console.error(exception)
+        return llmNodeInstance
+    }
+}
+
+/**
+ * Creates a Zod schema from a JSON schema object
+ * @param {any} jsonSchema - The JSON schema object
+ * @returns {z.ZodTypeAny} - A Zod schema
+ */
+export const createZodSchemaFromJSON = (jsonSchema: any): z.ZodTypeAny => {
+    // If the schema is an object with properties, create an object schema
+    if (typeof jsonSchema === 'object' && jsonSchema !== null) {
+        const schemaObj: Record<string, z.ZodTypeAny> = {}
+
+        // Process each property in the schema
+        for (const [key, value] of Object.entries(jsonSchema)) {
+            if (value === null) {
+                // Handle null values
+                schemaObj[key] = z.null()
+            } else if (typeof value === 'object' && !Array.isArray(value)) {
+                // Check if the property has a type definition
+                if ('type' in value) {
+                    const type = value.type as string
+                    const description = ('description' in value ? (value.description as string) : '') || ''
+
+                    // Create the appropriate Zod type based on the type property
+                    if (type === 'string') {
+                        schemaObj[key] = z.string().describe(description)
+                    } else if (type === 'number') {
+                        schemaObj[key] = z.number().describe(description)
+                    } else if (type === 'boolean') {
+                        schemaObj[key] = z.boolean().describe(description)
+                    } else if (type === 'array') {
+                        // If it's an array type, check if items is defined
+                        if ('items' in value && value.items) {
+                            const itemSchema = createZodSchemaFromJSON(value.items)
+                            schemaObj[key] = z.array(itemSchema).describe(description)
+                        } else {
+                            // Default to array of any if items not specified
+                            schemaObj[key] = z.array(z.any()).describe(description)
+                        }
+                    } else if (type === 'object') {
+                        // If it's an object type, check if properties is defined
+                        if ('properties' in value && value.properties) {
+                            const nestedSchema = createZodSchemaFromJSON(value.properties)
+                            schemaObj[key] = nestedSchema.describe(description)
+                        } else {
+                            // Default to record of any if properties not specified
+                            schemaObj[key] = z.record(z.any()).describe(description)
+                        }
+                    } else {
+                        // Default to any for unknown types
+                        schemaObj[key] = z.any().describe(description)
+                    }
+
+                    // Check if the property is optional
+                    if ('optional' in value && value.optional === true) {
+                        schemaObj[key] = schemaObj[key].optional()
+                    }
+                } else if (Array.isArray(value)) {
+                    // Array values without a type property
+                    if (value.length > 0) {
+                        // If the array has items, recursively create a schema for the first item
+                        const itemSchema = createZodSchemaFromJSON(value[0])
+                        schemaObj[key] = z.array(itemSchema)
+                    } else {
+                        // Empty array, allow any array
+                        schemaObj[key] = z.array(z.any())
+                    }
+                } else {
+                    // It's a nested object without a type property, recursively create schema
+                    schemaObj[key] = createZodSchemaFromJSON(value)
+                }
+            } else if (Array.isArray(value)) {
+                // Array values
+                if (value.length > 0) {
+                    // If the array has items, recursively create a schema for the first item
+                    const itemSchema = createZodSchemaFromJSON(value[0])
+                    schemaObj[key] = z.array(itemSchema)
+                } else {
+                    // Empty array, allow any array
+                    schemaObj[key] = z.array(z.any())
+                }
+            } else {
+                // For primitive values (which shouldn't be in the schema directly)
+                // Use the corresponding Zod type
+                if (typeof value === 'string') {
+                    schemaObj[key] = z.string()
+                } else if (typeof value === 'number') {
+                    schemaObj[key] = z.number()
+                } else if (typeof value === 'boolean') {
+                    schemaObj[key] = z.boolean()
+                } else {
+                    schemaObj[key] = z.any()
+                }
+            }
+        }
+
+        return z.object(schemaObj)
+    }
+
+    // Fallback to any for unknown types
+    return z.any()
+}
+
+export const extractResponseContent = (response: any): string => {
+    if (!response) return ''
+
+    const content = response.content
+
+    if (Array.isArray(content)) {
+        return content
+            .map((item: any) => {
+                if ((item.text && !item.type) || (item.type === 'text' && item.text)) {
+                    return item.text
+                }
+                return ''
+            })
+            .filter((text: string) => text)
+            .join('\n')
+    }
+
+    if (typeof content === 'string') return content
+    if (content != null) return JSON.stringify(content, null, 2)
+
+    return JSON.stringify(response, null, 2)
+}
+
+export const isReasoningModelOpenAI = (name: string): boolean => {
+    if (/^o[134]/.test(name)) return true
+    if (name === 'codex-mini') return true
+    if (name.includes('gpt-5') && name.includes('-chat')) return false
+    if (name.includes('gpt-5')) return true
+    return false
+}
+
+/**
+ * JSON Schema shape returned by {@link toolSchemaToJsonSchema}, extended with the
+ * optional `$schema` marker that `zod-to-json-schema` emits.
+ */
+export type ToolJsonSchema = JsonSchema7Type & { $schema?: string; [key: string]: unknown }
+
+type ZodToJsonSchemaInput = Parameters<typeof zodToJsonSchema>[0]
+
+/**
+ * Type guard detecting a Zod schema without importing Zod's types directly.
+ *
+ * Using `Parameters<typeof zodToJsonSchema>[0]` keeps the guard compatible with
+ * whichever Zod major version (`^3 || ^4`) TypeScript resolves at the call site.
+ */
+export const isZodSchema = (schema: unknown): schema is ZodToJsonSchemaInput =>
+    typeof schema === 'object' && schema !== null && '_def' in schema && typeof (schema as { parse?: unknown }).parse === 'function'
+
+/**
+ * Normalizes a tool schema into a plain JSON Schema object.
+ *
+ * LangChain tools may expose their `schema` as either a Zod schema (has `_def`)
+ * or an already-plain JSON Schema (e.g. MCP tools). This helper handles both,
+ * deep-clones plain objects to prevent accidental mutation, and strips the
+ * `$schema` marker so the result is safe to embed in LLM tool definitions.
+ */
+export const toolSchemaToJsonSchema = (schema: unknown): ToolJsonSchema => {
+    if (schema == null) return { type: 'object', properties: {} }
+    const jsonSchema: ToolJsonSchema = isZodSchema(schema)
+        ? (zodToJsonSchema(schema) as ToolJsonSchema)
+        : cloneDeep(schema as ToolJsonSchema)
+    if (jsonSchema.$schema) {
+        delete jsonSchema.$schema
+    }
+    return jsonSchema
 }
