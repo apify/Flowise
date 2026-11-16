@@ -12,7 +12,7 @@ class ApifyApiCredential implements INodeCredential {
         this.name = 'apifyApi'
         this.version = 1.0
         this.description =
-            'You can find the Apify API token on your <a target="_blank" href="https://console.apify.com/account#/integrations">Apify account</a> page.'
+            'Create an API token for Flowise in <a target="_blank" href="https://console.apify.com/settings/integrations?createApiToken=true&for=Flowise&utm_source=flowise&utm_medium=integrations">Apify Console</a> and copy it right after creating it — it is shown only once.'
         this.inputs = [
             {
                 label: 'Apify API',
